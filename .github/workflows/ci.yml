@@ -1,0 +1,22 @@
+# The test bench, on fakes only: no GPU, no FLOP image, no network to FLOP, nothing mined.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tools
+        run: apt-get update -qq && apt-get install -y -qq shellcheck jq openssl iproute2
+      - name: Shellcheck
+        run: shellcheck -x flop-miner tests/test.sh tests/run.sh
+      - name: Test bench
+        run: bash tests/test.sh flop-miner

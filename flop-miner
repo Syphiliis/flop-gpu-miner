@@ -1,0 +1,1288 @@
+#!/usr/bin/env bash
+# flop-miner: set up and run a FLOP devnet GPU miner on one Ubuntu machine, in one command.
+#
+# Unofficial community tool, MIT licence: https://github.com/Syphiliis/flop-gpu-miner
+# It downloads FLOP's public miner pack, checks its SHA-256 fingerprint, then runs the steps of the pack's README
+# for you: miner account, model, settings, GPU backend and worker, HTTPS session endpoint, sponsorship.
+#
+#   sudo bash flop-miner install [--domain NAME | --tunnel | --public] [--grant FILE] [--yes]
+#   sudo flop-miner status | logs | restart | stop | sponsor | backup | retire | uninstall | version | help
+set -Eeuo pipefail
+umask 022
+
+readonly FLOP_MINER_VERSION=0.1.0
+readonly REPO=https://github.com/Syphiliis/flop-gpu-miner
+
+# Pinned inputs, checked on 2026-11-05. A fingerprint is written as four groups of 16 hex characters.
+# FLOP's public miner pack, and its fingerprint as published on https://flop.network/skills/flop-miner-devnet/SKILL.md
+readonly PACK_NAME=flop-miner-pack-devnet-ts-20261103c
+readonly PACK_URL=${FLOP_MINER_PACK_URL:-https://flop.network/releases/cli/$PACK_NAME/$PACK_NAME.tar.gz}
+readonly PACK_SHA256=${FLOP_MINER_PACK_SHA256:-"0e590e50d995a6f5 c79edb732523a3c0 b156b4a231432abd ef8a77d4e4a86b10"}
+# The image the pack README uses to create the miner account (step 1), pinned by its digest
+readonly KEYGEN_IMAGE=ghcr.io/flop-labs/flop-core/node-devnet:sha-eea56e7
+readonly KEYGEN_DIGEST="61f1eebdc5ba2e58 ebf51881e10a80d3 03a7c31700ef376e d245efd0e6330259"
+# The model of the pack README (step 3)
+readonly MODEL_NAME=Qwen/Qwen2.5-0.5B-Instruct
+readonly MODEL_REVISION=7ae557604adf67be50417f59c2c2f167def9a775
+# Cloudflare's tunnel client, for machines that cannot open ports 80 and 443; fingerprint from its release notes
+readonly CLOUDFLARED_VERSION=2026.10.7
+readonly CLOUDFLARED_SHA256="1f99fb518b83dec2 ba8d870a7cc991d8 2a77e6196295a3d2 754ba17ab9f91872"
+# Host requirements. FLOP's GPU image is built on CUDA 13.0 (NVIDIA_REQUIRE_CUDA=cuda>=13.0), which needs the NVIDIA
+# driver 580.65.06 or newer; FLOP asks for 16 GB of VRAM (a 16 GB card reports about 16 300 MiB); the model runs in
+# BF16 (compute capability 8.0 or newer); the GPU image (9.1 GB compressed) and the model need about 50 GB of disk.
+readonly MIN_DRIVER=580.65.06
+readonly MIN_VRAM_MIB=15000
+readonly MIN_CC=8.0
+readonly MIN_DISK_GB=50
+
+readonly DIR=/opt/flop-miner # the pack README runs everything from this directory, and its settings point here
+readonly STATE=$DIR/.flop-miner
+readonly MODEL_DIR=$DIR/models/qwen2.5-0.5b-instruct
+readonly BIN=/usr/local/bin/flop-miner
+readonly UNITS=/etc/systemd/system
+readonly LOG=/var/log/flop-miner.log
+readonly EXPLORER=https://explorer.devnet.flop.network
+readonly WORKER_URL=http://127.0.0.1:8645/session/info # the worker's session port, on this machine only
+readonly SPONSOR_DAYS=7                                 # the automatic sponsorship retry stops after this many days
+readonly WAIT=${FLOP_MINER_WAIT:-600}                   # seconds to wait for the session endpoint
+
+ASSUME_YES=0 WANT_DOMAIN='' WANT_TUNNEL=0 WANT_PUBLIC=0 WANT_GRANT='' MODE=public HOST='' TMP='' PACK_CHANGED=0
+ARGS=() PACK_ENV=()
+
+# ---------------------------------------------------------------------------------------------------------------
+# Output
+
+if [ -t 1 ]; then
+  BOLD=$'\e[1m' GREEN=$'\e[32m' YELLOW=$'\e[33m' RED=$'\e[31m' RESET=$'\e[0m'
+else
+  BOLD='' GREEN='' YELLOW='' RED='' RESET=''
+fi
+say() { printf '%s\n' "$*"; }
+step() { printf '\n%s%s%s\n' "$BOLD" "$*" "$RESET"; }
+ok() { printf '  %sok%s    %s\n' "$GREEN" "$RESET" "$*"; }
+note() { printf '  %snote%s  %s\n' "$YELLOW" "$RESET" "$*"; }
+row() { printf '  %-18s %s\n' "$1" "$2"; }
+die() {
+  printf '\n%sError:%s %s\n' "$RED" "$RESET" "$*" >&2
+  exit 1
+}
+on_error() {
+  trap - ERR
+  printf '\n%sUnexpected error%s (line %s, code %s). Nothing is lost: run the same command again.\n' \
+    "$RED" "$RESET" "$1" "$2" >&2
+  printf 'If it fails again, see %s#troubleshooting (details in %s).\n' "$REPO" "$LOG" >&2
+  exit "$2"
+}
+trap 'on_error "$LINENO" "$?"' ERR
+trap '[ -z "$TMP" ] || rm -rf "$TMP"' EXIT
+
+log_open() {
+  [ -e "$LOG" ] || install -m 600 /dev/null "$LOG"
+  printf '\n== %s flop-miner %s %s\n' "$(date -u +%FT%TZ)" "$FLOP_MINER_VERSION" "$*" >> "$LOG"
+}
+# quiet WHAT COMMAND...: the command's output goes to the log; on failure, its last lines and a clear error
+quiet() {
+  local what=$1
+  shift
+  if ! "$@" >> "$LOG" 2>&1; then
+    tail -n 15 "$LOG" | sed 's/^/    /' >&2
+    die "$what failed. Full log: $LOG"
+  fi
+}
+# ask QUESTION: yes by default; --yes answers for the user
+ask() {
+  local answer
+  [ "$ASSUME_YES" = 0 ] || return 0
+  if ! { printf '%s [Y/n] ' "$1" > /dev/tty && read -r answer < /dev/tty; } 2> /dev/null; then
+    die "This step needs your answer, but there is no terminal: run the same command again with --yes"
+  fi
+  case $answer in '' | [yY] | [yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+}
+# confirm_word WORD QUESTION: the user types WORD; --yes answers for the user
+confirm_word() {
+  local answer
+  [ "$ASSUME_YES" = 0 ] || return 0
+  if ! { printf '%s Type %s to continue: ' "$2" "$1" > /dev/tty && read -r answer < /dev/tty; } 2> /dev/null; then
+    die "This step needs your answer, but there is no terminal: run the same command again with --yes"
+  fi
+  [ "$answer" = "$1" ]
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# Small helpers
+
+require_root() { [ "$(id -u)" = 0 ] || die "Run it as root: put sudo in front of the command (sudo flop-miner $1)."; }
+require_installed() {
+  if [ ! -f "$DIR/miner.env" ] || [ ! -s "$DIR/address" ]; then
+    die "The miner is not installed on this machine yet: sudo bash flop-miner install"
+  fi
+}
+envget() { if [ -f "$DIR/miner.env" ]; then sed -n "s/^$1=//p" "$DIR/miner.env" | tail -n 1; fi; }
+set_kv() {
+  if grep -q "^$1=" "$DIR/miner.env"; then
+    sed -i "s|^$1=.*|$1=$2|" "$DIR/miner.env"
+  else
+    printf '%s=%s\n' "$1" "$2" >> "$DIR/miner.env"
+  fi
+}
+address() { if [ -s "$DIR/address" ]; then cat "$DIR/address"; fi; }
+# A state flag holds the address it was written for: a flag of another account means nothing for this one
+flag() { [ -s "$STATE/$1" ] && [ "$(cat "$STATE/$1")" = "$(address)" ]; }
+set_flag() { address > "$STATE/$1"; }
+mode() { if [ -s "$STATE/mode" ]; then cat "$STATE/mode"; else echo public; fi; }
+# The pack's Compose files (README, step 3); its TLS sidecar only when the machine serves ports 80 and 443 itself
+compose() {
+  local files=(-f docker-compose.miner.yml -f docker-compose.backend.yml)
+  [ "$(mode)" = tunnel ] || files+=(-f docker-compose.tls.yml)
+  (cd "$DIR" && docker compose --env-file miner.env "${files[@]}" "$@")
+}
+trim() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  printf '%s' "${s%"${s##*[![:space:]]}"}"
+}
+version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | sed -n 1p)" = "$2" ]; } # version_ge HAVE MIN
+cc_ge() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 >= b + 0) }'; }
+http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@" 2> /dev/null || true; }
+# apt waits for the lock that cloud-init or unattended-upgrades hold on a fresh machine
+apt_get() { DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 "$@"; }
+apt_get_install() { apt_get install -y -q "$@"; }
+wait_first_boot() {
+  local status
+  command -v cloud-init > /dev/null || return 0
+  status=$(cloud-init status 2> /dev/null) || status=''
+  [[ $status == *running* ]] || return 0
+  say "  Waiting for the machine's first-boot setup (cloud-init) to finish..."
+  cloud-init status --wait >> "$LOG" 2>&1 || true
+}
+# The explorer's record of a miner: printed with status 0; status 1 when not registered, 2 when unreadable
+miner_json() {
+  local out
+  out=$(curl -sS --max-time 20 -w '\n%{http_code}' "$EXPLORER/api/miners/$1" 2> /dev/null) || return 2
+  case ${out##*$'\n'} in
+    200) printf '%s\n' "${out%$'\n'*}" ;;
+    404) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+# run_pack SECONDS MJS SCRIPT ARGS...: a script of FLOP's pack, with this miner's settings and a time limit. The
+# scripts run node in FLOP's CLI image, which waits without end when FLOP's RPC does not answer and ignores the
+# stop signal: past the limit, the container left behind (the one that mounts MJS, and only it) is removed.
+run_pack() {
+  local limit=$1 mjs=$2 script=$3 rc=0 v cli ids=()
+  shift 3
+  PACK_ENV=(MINER_SIGNER_FILE="$DIR/signer")
+  for v in FLOP_CLI FLOP_RPC; do [ -z "$(envget "$v")" ] || PACK_ENV+=("$v=$(envget "$v")"); done
+  [ ! -f "$DIR/grant.json" ] || PACK_ENV+=(GRANT_FILE="$DIR/grant.json")
+  (cd "$DIR" && env "${PACK_ENV[@]}" timeout -k 10 "$limit" "./$script" "$@") || rc=$?
+  if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+    cli=$(envget FLOP_CLI)
+    mapfile -t ids < <(docker ps -aq --filter "ancestor=${cli:-ghcr.io/flop-labs/flop-core/cli:stable}" \
+      --filter "volume=/app/$mjs" 2> /dev/null || true)
+    [ "${#ids[@]}" = 0 ] || docker rm -f "${ids[@]}" > /dev/null 2>&1 || true
+    echo "$script: no answer from FLOP's devnet within $limit seconds"
+  fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# 1. Checking the machine
+
+# A field of /etc/os-release, read without sourcing the file (its variables would clash with this script's)
+os_field() { sed -n "s/^$1=//p" /etc/os-release 2> /dev/null | tr -d '"' | tail -n 1; }
+
+in_container() {
+  [ -f /.dockerenv ] || [ -f /run/.containerenv ] && return 0
+  command -v systemd-detect-virt > /dev/null && systemd-detect-virt --container --quiet && return 0
+  return 1
+}
+
+check_system() {
+  local os_id os_version where=/var/lib gb
+  [ "$(uname -m)" = x86_64 ] ||
+    die "This machine is $(uname -m): FLOP's images exist for x86-64 (amd64) machines only."
+  os_id=$(os_field ID) os_version=$(os_field VERSION_ID)
+  case "$os_id $os_version" in
+    "ubuntu 22.04" | "ubuntu 24.04") ;;
+    *) die "This machine runs ${os_id:-an unknown system} $os_version. The installer needs Ubuntu 24.04 (or 22.04): reinstall the machine with Ubuntu 24.04 at your provider." ;;
+  esac
+  if [ "${FLOP_MINER_ALLOW_CONTAINER:-0}" != 1 ] && in_container; then
+    die "This machine is a container (often sold as a \"pod\"), not a full virtual machine. FLOP's miner runs in Docker, which a container cannot run. Rent a GPU virtual machine (VM) or a dedicated server instead: $REPO#1-rent-a-gpu-machine"
+  fi
+  command -v systemctl > /dev/null || die "systemd is required (it is there by default on Ubuntu)."
+  [ ! -d /var/lib/docker ] || where=/var/lib/docker
+  gb=$(df -Pk "$where" | awk 'NR == 2 { print int($4 / 1048576) }')
+  [ "${gb:-0}" -ge "$MIN_DISK_GB" ] ||
+    die "Only ${gb:-0} GB of free disk: $MIN_DISK_GB GB are needed (FLOP's GPU image and the model). Pick a machine with at least 80 GB of disk."
+  ok "Ubuntu $os_version, x86-64, $gb GB of free disk"
+}
+
+offer_driver() {
+  local secure_boot
+  say "  No NVIDIA driver on this machine (the nvidia-smi command is missing)."
+  say "  Simplest fix: at your provider, pick a machine image that already has the NVIDIA driver 580 or newer."
+  if ask "  Or install the NVIDIA driver 580 from Ubuntu now? The machine must reboot afterwards."; then
+    log_open driver
+    wait_first_boot
+    quiet "Updating the package lists" apt_get update
+    quiet "Installing the NVIDIA driver" apt_get_install "linux-headers-$(uname -r)" nvidia-driver-580-server-open
+    say ""
+    say "The NVIDIA driver is installed. Reboot the machine now:  sudo reboot"
+    say "Then reconnect and run the same command again: the installer goes on from there."
+    secure_boot=$(mokutil --sb-state 2> /dev/null) || secure_boot=''
+    if [[ ${secure_boot,,} == *enabled* ]]; then
+      note "Secure Boot is on: it may block the driver after the reboot. If nvidia-smi still fails then, turn"
+      note "Secure Boot off in your provider's console, or pick a machine image with the NVIDIA driver."
+    fi
+    exit 3
+  fi
+  die "An NVIDIA driver (580 or newer) is required."
+}
+
+check_gpu() {
+  local driver line name mem cc count
+  command -v nvidia-smi > /dev/null || offer_driver
+  # The driver first, alone: an old driver does not know every field of the next query
+  driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2> /dev/null | sed -n 1p) || driver=''
+  driver=$(trim "$driver")
+  [ -n "$driver" ] || die "The NVIDIA driver does not answer (nvidia-smi failed). Reboot the machine (sudo reboot), reconnect, and run the same command again. If it still fails, pick a machine image with the NVIDIA driver."
+  if ! version_ge "$driver" "$MIN_DRIVER"; then
+    if [ "${FLOP_MINER_SKIP_DRIVER_CHECK:-0}" = 1 ]; then
+      note "NVIDIA driver $driver is older than $MIN_DRIVER: going on anyway (FLOP_MINER_SKIP_DRIVER_CHECK=1)"
+    else
+      die "The NVIDIA driver is $driver: FLOP's GPU image needs $MIN_DRIVER or newer (CUDA 13). Update it (sudo apt-get install -y nvidia-driver-580-server-open, then sudo reboot), or pick a machine image with a newer driver."
+    fi
+  fi
+  line=$(nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader,nounits 2> /dev/null | sed -n 1p) ||
+    line=''
+  IFS=',' read -r name mem cc <<< "$line"
+  name=$(trim "${name:-}") mem=$(trim "${mem:-}") cc=$(trim "${cc:-}")
+  [[ $mem =~ ^[0-9]+$ ]] || die "Could not read the GPU from nvidia-smi: ${line:-no answer}"
+  count=$(nvidia-smi -L 2> /dev/null | grep -c '^GPU ' || true)
+  [ "$mem" -ge "$MIN_VRAM_MIB" ] ||
+    die "The GPU ($name) has $(((mem + 512) / 1024)) GB of memory: FLOP needs at least 16 GB."
+  cc_ge "$cc" "$MIN_CC" ||
+    die "The GPU ($name) is too old for FLOP (compute capability $cc, 8.0 or newer needed: RTX 30 series or newer, A-series, L4, L40S, A100, H100...)."
+  ok "$name, $(((mem + 512) / 1024)) GB, driver $driver${count:+ ($count GPU)}"
+}
+
+is_public_ipv4() {
+  local a b
+  [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]}
+  case $a in
+    0 | 10 | 127) return 1 ;;
+    100) [ "$b" -lt 64 ] || [ "$b" -gt 127 ] || return 1 ;;
+    169) [ "$b" != 254 ] || return 1 ;;
+    172) [ "$b" -lt 16 ] || [ "$b" -gt 31 ] || return 1 ;;
+    192) [ "$b" != 168 ] || return 1 ;;
+  esac
+  [ "$a" -lt 224 ]
+}
+# This machine's public IPv4: from its own network interfaces when it has one, else as seen from the internet
+public_ipv4() {
+  local ip url
+  for ip in $(ip -4 -o addr show scope global 2> /dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }'); do
+    if is_public_ipv4 "$ip"; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  for url in https://api.ipify.org https://checkip.amazonaws.com https://icanhazip.com; do
+    ip=$(curl -4 -fsS --max-time 10 "$url" 2> /dev/null | tr -d '[:space:]') || continue
+    if is_public_ipv4 "$ip"; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+valid_name() { [[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
+resolves_to() { getent ahostsv4 "$1" 2> /dev/null | awk '{ print $1 }' | grep -xF "$2" > /dev/null; }
+
+# Sets MODE and HOST. Public mode: Caddy, the pack's TLS sidecar, gets a certificate on ports 80 and 443 for a
+# name that points to this machine (yours with --domain, else <ip>.sslip.io). Tunnel mode: no port to open.
+# A re-run keeps the mode and the name of the first run, unless an option changes them.
+choose_network() {
+  local ip saved saved_mode=''
+  saved=$(envget SESSION_PUBLIC_HOST)
+  [ ! -s "$STATE/mode" ] || saved_mode=$(cat "$STATE/mode")
+  if [ "$WANT_TUNNEL" = 1 ] || { [ -z "$WANT_DOMAIN" ] && [ "$WANT_PUBLIC" = 0 ] && [ "$saved_mode" = tunnel ]; }; then
+    MODE=tunnel
+    ok "Network: a free Cloudflare tunnel (no port to open)"
+    return 0
+  fi
+  MODE=public HOST=''
+  if [ -n "$WANT_DOMAIN" ]; then
+    HOST=$WANT_DOMAIN
+  elif [ "$WANT_PUBLIC" = 0 ] && [ -n "$saved" ] && [[ $saved != *.sslip.io && $saved != *.trycloudflare.com ]]; then
+    HOST=$saved # a domain given at an earlier run
+  fi
+  ip=$(public_ipv4) || ip=''
+  if [ -z "$HOST" ]; then
+    if [ -n "$ip" ]; then
+      HOST=${ip//./-}.sslip.io
+    elif [ "$saved_mode" = public ] && [[ $saved == *.sslip.io ]]; then
+      HOST=$saved
+      note "Could not find the public IP address right now: keeping https://$HOST"
+    elif [ -z "$saved_mode" ] && [ "$WANT_PUBLIC" = 0 ]; then
+      MODE=tunnel
+      note "No public IPv4 address found: the miner will use a free Cloudflare tunnel (no port to open)."
+      return 0
+    else
+      die "Could not find this machine's public IPv4 address. Run the same command again later, or with --domain NAME or --tunnel."
+    fi
+  fi
+  valid_name "$HOST" || die "Not a valid domain name: $HOST"
+  if [ -n "$ip" ] && ! resolves_to "$HOST" "$ip"; then
+    if [[ $HOST == *.sslip.io ]]; then
+      note "Could not check that $HOST points to $ip (DNS lookup failed on this machine): going on."
+    else
+      die "$HOST does not point to this machine ($ip). At your domain's DNS, create an A record for $HOST with the value $ip, wait a few minutes, then run the same command again."
+    fi
+  fi
+  ok "Public address: https://$HOST${ip:+ ($ip); ports 80 and 443 must be open}"
+}
+
+check_ports() {
+  local p line who
+  for p in 80 443; do
+    line=$(ss -Hltnp "sport = :$p" 2> /dev/null | sed -n 1p) || line=''
+    [ -n "$line" ] || continue
+    [[ $line != *'"caddy"'* ]] || continue # the pack's TLS sidecar, from an earlier run
+    who=$(sed -nE 's/.*users:\(\("([^"]+)".*/\1/p' <<< "$line")
+    die "Port $p is already used on this machine (by ${who:-another program}). Use a machine dedicated to the miner, or run the installer with --tunnel."
+  done
+}
+
+print_plan() {
+  say ""
+  say "The installer will now:"
+  say "  - install what is missing: Docker, the NVIDIA container toolkit, jq, curl, openssl"
+  say "  - download FLOP's public miner pack and check its fingerprint"
+  say "  - create your miner account on this machine (its secret never leaves the machine)"
+  say "  - download the model (about 1 GB) and FLOP's GPU image (about 9 GB), then start the miner"
+  if [ "$MODE" = public ]; then
+    say "  - serve the miner's HTTPS endpoint at https://$HOST"
+  else
+    say "  - serve the miner's HTTPS endpoint through a free Cloudflare tunnel"
+  fi
+  say "  - ask FLOP's devnet sponsor to register your miner, and retry every hour while it is full"
+  say ""
+  say "This is FLOP's devnet: test FLOP has no value, and there are no earnings and no airdrop."
+  say "Your provider bills the GPU machine for as long as it exists."
+  say ""
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# 2. Dependencies
+
+install_docker() {
+  local codename pkg remove=()
+  codename=$(os_field UBUNTU_CODENAME)
+  [ -n "$codename" ] || codename=$(os_field VERSION_CODENAME)
+  # Docker's install guide for Ubuntu: remove the packages that conflict with Docker's own, then its repository
+  for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
+    if dpkg -s "$pkg" > /dev/null 2>&1; then remove+=("$pkg"); fi
+  done
+  [ "${#remove[@]}" = 0 ] || quiet "Removing ${remove[*]}" apt_get remove -y "${remove[@]}"
+  install -m 0755 -d /etc/apt/keyrings
+  quiet "Downloading Docker's signing key" curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+  printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
+    "$(dpkg --print-architecture)" "$codename" > /etc/apt/sources.list.d/docker.list
+  quiet "Updating the package lists" apt_get update
+  quiet "Installing Docker" apt_get_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  ok "Docker installed (official repository)"
+}
+
+install_nvidia_toolkit() {
+  # NVIDIA's install guide for the container toolkit (apt)
+  quiet "Downloading NVIDIA's signing key" sh -c 'curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg'
+  quiet "Adding NVIDIA's repository" sh -c "curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list"
+  quiet "Updating the package lists" apt_get update
+  quiet "Installing the NVIDIA container toolkit" apt_get_install nvidia-container-toolkit
+  quiet "Giving Docker access to the GPU" nvidia-ctk runtime configure --runtime=docker
+  quiet "Restarting Docker" systemctl restart docker
+  ok "NVIDIA container toolkit installed"
+}
+
+has_nvidia_runtime() { docker info --format '{{json .Runtimes}}' 2> /dev/null | jq -e 'has("nvidia")' > /dev/null 2>&1; }
+
+install_deps() {
+  local pkg need=()
+  wait_first_boot
+  for pkg in curl jq openssl ca-certificates gnupg; do
+    dpkg -s "$pkg" > /dev/null 2>&1 || need+=("$pkg")
+  done
+  if [ "${#need[@]}" -gt 0 ]; then
+    quiet "Updating the package lists" apt_get update
+    quiet "Installing ${need[*]}" apt_get_install "${need[@]}"
+  fi
+  if ! command -v docker > /dev/null; then
+    install_docker
+  elif [[ $(readlink -f "$(command -v docker)") == /snap/* ]]; then
+    die "Docker is installed as a snap, which cannot reach $DIR. Remove it (sudo snap remove docker), then run the same command again: the installer then installs Docker from Docker's repository."
+  elif ! docker compose version > /dev/null 2>&1; then
+    quiet "Updating the package lists" apt_get update
+    apt_get_install docker-compose-plugin >> "$LOG" 2>&1 || apt_get_install docker-compose-v2 >> "$LOG" 2>&1 ||
+      die "Docker is installed but without Compose, and Compose could not be added. Install it (https://docs.docker.com/compose/install/linux/), then run the same command again."
+  fi
+  systemctl enable --now docker >> "$LOG" 2>&1 || true
+  docker compose version > /dev/null 2>&1 || die "Docker Compose does not work on this machine (see $LOG)."
+  ok "Docker and Compose ready"
+  has_nvidia_runtime || install_nvidia_toolkit
+  has_nvidia_runtime ||
+    die "Docker does not see the NVIDIA runtime. Reboot the machine (sudo reboot), then run the same command again."
+  ok "Docker sees the NVIDIA runtime"
+}
+
+open_firewall() {
+  local status
+  command -v ufw > /dev/null || return 0
+  status=$(ufw status 2> /dev/null) || status=''
+  [[ $status == *"Status: active"* ]] || return 0
+  quiet "Opening ports 80 and 443 in the firewall" sh -c 'ufw allow 80/tcp && ufw allow 443/tcp && ufw allow 443/udp'
+  ok "Firewall (ufw): ports 80 and 443 open"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# 3. FLOP's miner pack
+
+pack_complete() {
+  local f
+  for f in README.md miner.env.example docker-compose.miner.yml docker-compose.backend.yml docker-compose.tls.yml \
+    fetch-model.sh fetch-model.requirements.txt decode-policy.sh decode-policy.mjs sponsor.sh sponsor-request.mjs \
+    retire.sh retire.mjs; do
+    [ -f "$DIR/$f" ] || return 1
+  done
+}
+
+fetch_pack() {
+  local want=${PACK_SHA256// /} have f old
+  old=$(cat "$STATE/pack" 2> /dev/null || true)
+  if [ "$old" = "$want" ] && pack_complete; then
+    ok "FLOP's miner pack is already here ($PACK_NAME)"
+    return 0
+  fi
+  curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --max-time 300 -o "$TMP/pack.tar.gz" "$PACK_URL" >> "$LOG" 2>&1 ||
+    die "Could not download FLOP's miner pack ($PACK_URL). Check the machine's internet access, then run the same command again."
+  have=$(sha256sum "$TMP/pack.tar.gz" | cut -d' ' -f1)
+  [ "$have" = "$want" ] ||
+    die "FLOP's miner pack does not have the expected fingerprint, so it was not used. FLOP may have published a new pack: look for an update of this installer at $REPO"
+  mkdir "$TMP/pack"
+  tar -xzf "$TMP/pack.tar.gz" -C "$TMP/pack" --strip-components=1 --no-same-owner ||
+    die "Could not unpack FLOP's miner pack."
+  # The pack never brings a file of the miner's own state: nothing of yours is replaced
+  for f in signer miner-key.json miner.env session-keys models address grant.json .flop-miner; do
+    [ ! -e "$TMP/pack/$f" ] || die "FLOP's miner pack holds an unexpected file ($f): nothing was changed."
+  done
+  cp -R "$TMP/pack/." "$DIR/"
+  pack_complete || die "FLOP's miner pack lacks a file this installer needs: look for an update at $REPO"
+  echo "$want" > "$STATE/pack"
+  [ -z "$old" ] || PACK_CHANGED=1 # a new pack: its settings replace the old ones (write_env)
+  ok "FLOP's miner pack $PACK_NAME, fingerprint checked"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# 4. The miner account (pack README, step 1). The secret phrase is created here, offline, and stays on this machine.
+
+create_account() {
+  local image="$KEYGEN_IMAGE@sha256:${KEYGEN_DIGEST// /}" tmp addr json_addr known f
+  known=$(address)
+  # An account that is gone while this machine still knows it: never draw a new one in its place silently
+  if [ -n "$known" ] && [ ! -e "$DIR/miner-key.json" ] && [ ! -e "$DIR/signer" ]; then
+    die "The files of your miner account are missing ($DIR/signer and $DIR/miner-key.json), while this machine ran the miner $known. Put them back from your backup, then run the same command again. To start over with a new miner account instead, move $DIR/address and $STATE aside, then run the same command again."
+  fi
+  for f in miner-key.json signer; do
+    if [ -e "$DIR/$f" ] && [ ! -s "$DIR/$f" ]; then
+      die "$DIR/$f is empty. Move it aside (or delete it if you are sure it holds nothing), then run the same command again."
+    fi
+  done
+  if [ ! -e "$DIR/miner-key.json" ] && [ ! -e "$DIR/signer" ]; then
+    tmp=$(mktemp "$DIR/.miner-key.XXXXXX")
+    if ! docker run --rm --network none --log-driver none --user 0:0 --entrypoint zkv-relay "$image" \
+      key generate --scheme sr25519 --output-type json > "$tmp" 2>> "$LOG" ||
+      ! jq -e '(.secretPhrase | type == "string" and length > 0) and (.ss58Address | type == "string")' "$tmp" > /dev/null 2>&1 ||
+      ! mv -n "$tmp" "$DIR/miner-key.json" || [ -e "$tmp" ]; then
+      rm -f "$tmp"
+      die "Could not create the miner account (see $LOG). Run the same command again."
+    fi
+    # A new account starts with no sponsorship and no retirement
+    rm -f "$STATE/sponsored" "$STATE/retired" "$STATE/sponsor-since" "$STATE/sponsor-last" "$STATE/sponsor-message"
+    ok "Miner account created on this machine"
+  else
+    ok "Existing miner account kept"
+  fi
+  if [ ! -e "$DIR/signer" ]; then
+    (umask 077 && jq -r .secretPhrase "$DIR/miner-key.json" > "$DIR/.signer.tmp" && mv -n "$DIR/.signer.tmp" "$DIR/signer")
+    rm -f "$DIR/.signer.tmp"
+  fi
+  chmod 600 "$DIR/signer"
+  [ ! -f "$DIR/miner-key.json" ] || chmod 600 "$DIR/miner-key.json"
+  # The address the worker will sign with: derived from the signer file, offline
+  addr=$(docker run --rm --network none --log-driver none --user 0:0 -v "$DIR/signer:/run/flop/signer:ro" \
+    --entrypoint zkv-relay "$image" key inspect --scheme sr25519 --output-type json /run/flop/signer 2>> "$LOG" |
+    jq -r '.ss58Address // empty' 2> /dev/null) || addr=''
+  [[ $addr =~ ^[1-9A-HJ-NP-Za-km-z]{46,48}$ ]] || die "Could not read the miner address from $DIR/signer (see $LOG)."
+  if [ -s "$DIR/miner-key.json" ]; then
+    json_addr=$(jq -r '.ss58Address // empty' "$DIR/miner-key.json" 2> /dev/null) || json_addr=''
+    [ "$json_addr" = "$addr" ] ||
+      die "$DIR/miner-key.json and $DIR/signer are two different accounts. Keep the right one (the other may be a backup), then run the same command again."
+  fi
+  if [ -n "$known" ] && [ "$known" != "$addr" ]; then
+    rm -f "$STATE/sponsored" "$STATE/retired" "$STATE/sponsor-since" "$STATE/sponsor-last" "$STATE/sponsor-message"
+    note "The miner account changed: it was $known, it is now $addr (restored from another backup?)."
+  fi
+  printf '%s\n' "$addr" > "$DIR/address"
+  chmod 644 "$DIR/address"
+  ok "Miner address: $addr"
+}
+
+install_self() {
+  local me
+  me=$(readlink -f "$0" 2> /dev/null) || me=''
+  if [ -n "$me" ] && [ -f "$me" ] && [ "$me" != "$BIN" ] && grep -q '^readonly FLOP_MINER_VERSION=' "$me"; then
+    install -m 755 "$me" "$BIN"
+  fi
+  if [ -x "$BIN" ]; then
+    ok "Command installed: flop-miner (try: sudo flop-miner help)"
+  else
+    note "The flop-miner command could not be installed: run this file instead (sudo bash $0 status)."
+  fi
+}
+
+save_grant() {
+  local addr
+  addr=$(address)
+  # sponsor-request.mjs of the pack refuses, before sending anything, a grant for another role or another account
+  jq -e --arg a "$addr" '.role == "miner" and .account == $a' "$WANT_GRANT" > /dev/null 2>&1 ||
+    die "$WANT_GRANT is not a grant for this miner: it must be a miner grant for $addr, made with the pack's sponsor-grant.sh."
+  [ "$WANT_GRANT" -ef "$DIR/grant.json" ] || install -m 644 -- "$WANT_GRANT" "$DIR/grant.json"
+  ok "Operator grant saved: it goes with the sponsorship request"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# 5. Model, session key, settings (pack README, step 3)
+
+fetch_model() {
+  local stamp=$STATE/model-$MODEL_REVISION resume=()
+  if [ -f "$stamp" ] && [ -n "$(ls -A "$MODEL_DIR" 2> /dev/null)" ]; then
+    ok "Model $MODEL_NAME already downloaded"
+    return 0
+  fi
+  # fetch-model.sh refuses a directory that is not empty: an interrupted download goes on with --resume
+  [ -z "$(ls -A "$MODEL_DIR" 2> /dev/null)" ] || resume=(--resume)
+  say "  Downloading $MODEL_NAME (about 1 GB)..."
+  if ! (cd "$DIR" && ./fetch-model.sh "$MODEL_NAME" "$MODEL_REVISION" "$MODEL_DIR" "${resume[@]}") >> "$LOG" 2>&1; then
+    tail -n 15 "$LOG" | sed 's/^/    /' >&2
+    die "Could not download the model. Run the same command again."
+  fi
+  touch "$stamp" # outside the model directory: the worker measures every file in it
+  ok "Model $MODEL_NAME downloaded"
+}
+
+make_session_key() {
+  if [ -e "$DIR/session-keys/enclave.seed" ]; then
+    ok "Session key kept"
+    return 0
+  fi
+  install -d -m 700 "$DIR/session-keys"
+  (umask 077 && set -C && openssl rand -hex 32 > "$DIR/session-keys/enclave.seed")
+  ok "Session key created"
+}
+
+# miner.env, from the pack's miner.env.example (README, step 3). The miner's own values (the two tokens and the
+# public name) are kept across runs; when the pack changes, every other setting comes from the new pack, and the
+# decode policy is taken again.
+write_env() {
+  local env=$DIR/miner.env key line keep=()
+  if [ -f "$env" ] && [ "$PACK_CHANGED" = 1 ]; then
+    for key in INFERENCE_API_KEY SESSION_AUTH_TOKEN; do keep+=("$key=$(envget "$key")"); done
+    (umask 077 && cp "$env" "$STATE/miner.env.before-$(date -u +%Y%m%d-%H%M%S)")
+    (umask 077 && cp "$DIR/miner.env.example" "$env.new") && mv -f "$env.new" "$env"
+    note "New FLOP pack: settings taken from it (the previous file is kept in $STATE)"
+  fi
+  [ -f "$env" ] || (umask 077 && cp "$DIR/miner.env.example" "$env")
+  chmod 600 "$env"
+  for line in "${keep[@]}"; do set_kv "${line%%=*}" "${line#*=}"; done
+  # A setting that a newer pack adds is appended with the pack's value; existing values are kept
+  while IFS= read -r line; do
+    key=${line%%=*}
+    grep -q "^$key=" "$env" || printf '%s\n' "$line" >> "$env"
+  done < <(grep -E '^[A-Z][A-Z0-9_]*=' "$DIR/miner.env.example" || true)
+  for key in INFERENCE_API_KEY SESSION_AUTH_TOKEN; do
+    [ -n "$(envget "$key")" ] || set_kv "$key" "$(openssl rand -hex 32)"
+  done
+  set_kv SESSION_PUBLIC_HOST "$HOST"
+  ok "Settings written ($env, readable by root only)"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# Tunnel mode: a Cloudflare quick tunnel (no account) carries https://<random>.trycloudflare.com to the session port.
+# Its address changes when the tunnel restarts: a timer follows it and gives the worker the new address.
+
+install_cloudflared() {
+  local have
+  have=$(/usr/local/bin/cloudflared --version 2> /dev/null | awk '{ print $3 }') || have=''
+  [ "$have" != "$CLOUDFLARED_VERSION" ] || return 0
+  curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --max-time 300 -o "$TMP/cloudflared" \
+    "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-linux-amd64" >> "$LOG" 2>&1 ||
+    die "Could not download cloudflared (Cloudflare's tunnel client)."
+  [ "$(sha256sum "$TMP/cloudflared" | cut -d' ' -f1)" = "${CLOUDFLARED_SHA256// /}" ] ||
+    die "cloudflared does not have the expected fingerprint, so it was not installed."
+  install -m 755 "$TMP/cloudflared" /usr/local/bin/cloudflared
+}
+
+write_tunnel_units() {
+  cat > "$UNITS/flop-miner-tunnel.service" << EOF
+[Unit]
+Description=FLOP miner: Cloudflare quick tunnel to the session endpoint
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+ExecStartPre=/bin/sh -c ': > $STATE/tunnel.log'
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8645
+StandardOutput=append:$STATE/tunnel.log
+StandardError=append:$STATE/tunnel.log
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > "$UNITS/flop-miner-sync.service" << EOF
+[Unit]
+Description=FLOP miner: follow the tunnel's address
+After=docker.service flop-miner-tunnel.service
+
+[Service]
+Type=oneshot
+ExecStart=$BIN tunnel-sync
+EOF
+  cat > "$UNITS/flop-miner-sync.timer" << EOF
+[Unit]
+Description=FLOP miner: follow the tunnel's address every two minutes
+
+[Timer]
+OnActiveSec=2min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# The tunnel's current host name, waiting up to $1 seconds for it. cloudflared's log also names Cloudflare's own
+# API host (api.trycloudflare.com) when a request fails: that one is never the tunnel.
+tunnel_host() {
+  local waited=0 url
+  while :; do
+    url=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$STATE/tunnel.log" 2> /dev/null |
+      grep -v '^https://api\.' | tail -n 1) || url=''
+    if [ -n "$url" ]; then
+      echo "${url#https://}"
+      return 0
+    fi
+    [ "$waited" -lt "$1" ] || return 1
+    sleep 2
+    waited=$((waited + 2))
+  done
+}
+
+start_tunnel() {
+  [ -x "$BIN" ] || die "Tunnel mode needs the flop-miner command: download the installer to a file, then run sudo bash flop-miner install --tunnel"
+  install_cloudflared
+  write_tunnel_units
+  systemctl daemon-reload
+  quiet "Enabling the tunnel" systemctl enable flop-miner-tunnel.service flop-miner-sync.timer
+  systemctl is-active --quiet flop-miner-tunnel.service || quiet "Starting the tunnel" systemctl start flop-miner-tunnel.service
+  quiet "Starting the tunnel's timer" systemctl start flop-miner-sync.timer
+  HOST=$(tunnel_host 60) || die "The Cloudflare tunnel gave no address within a minute (see $STATE/tunnel.log). Run the same command again."
+  ok "Cloudflare tunnel: https://$HOST"
+}
+
+stop_tunnel() {
+  systemctl disable --now flop-miner-sync.timer flop-miner-tunnel.service >> "$LOG" 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# 6. Starting: the pack README's line, `./decode-policy.sh miner.env && $C pull && $C up -d`
+
+start_stack() { # start_stack [options of compose up]
+  local rc=0 cli
+  # FLOP's CLI image first: its download must not eat the time limit of the decode-policy check
+  cli=$(envget FLOP_CLI)
+  [ -z "$cli" ] || quiet "Downloading FLOP's CLI image" docker pull -q "$cli"
+  run_pack 180 decode-policy.mjs decode-policy.sh miner.env >> "$LOG" 2>&1 || rc=$?
+  # decode-policy.sh only checks a policy already written: one that FLOP's chain has since dropped is refused.
+  # Then take the policy FLOP publishes now, once.
+  if [ "$rc" != 0 ] && [ "$rc" != 124 ] && [ "$rc" != 137 ] && [ -n "$(envget DECODE_POLICY)" ]; then
+    set_kv DECODE_POLICY ''
+    set_kv DECODE_POLICY_HASH ''
+    rc=0
+    run_pack 180 decode-policy.mjs decode-policy.sh miner.env >> "$LOG" 2>&1 || rc=$?
+  fi
+  if [ "$rc" != 0 ]; then
+    tail -n 10 "$LOG" | sed 's/^/    /' >&2
+    die "FLOP's decode-policy check did not pass (code $rc): FLOP's devnet may be busy, or the model's policy changed. Nothing was started. Wait a few minutes, then run the same command again."
+  fi
+  ok "Decode policy accepted by FLOP's devnet"
+  say "  Downloading FLOP's images (the GPU image weighs about 9 GB: this can take a few minutes)..."
+  compose pull || die "Could not download FLOP's images. Check the machine's internet access, then run the same command again."
+  quiet "Starting the miner" compose up -d --remove-orphans "$@"
+  rm -f "$STATE/stopped"
+  ok "Miner started: GPU backend, worker$([ "$(mode)" = tunnel ] || printf ', HTTPS sidecar')"
+}
+
+tls_errors() {
+  compose logs --no-color --tail 300 tls 2> /dev/null |
+    grep -E 'acme:error|could not get certificate|solving challenges|rateLimited|too many certificates' | tail -n 3 || true
+}
+
+# The worker refuses anonymous calls with 401: that proves it is up, and reachable at its public address.
+# Prints "public", "local" (it answers on this machine only, which some clouds cause), "tls" or "none".
+wait_endpoint() {
+  local url="https://$HOST/session/info" waited=0
+  while :; do
+    [ "$(http_code "$url")" != 401 ] || { echo public && return 0; }
+    if [ "$MODE" = public ] && [ "$waited" -ge 60 ]; then
+      [ "$(http_code --resolve "$HOST:443:127.0.0.1" "$url")" != 401 ] || { echo local && return 0; }
+      # A certificate error shows up within two minutes: no need to wait longer for it
+      if [ "$waited" -ge 120 ] && [ -n "$(tls_errors)" ]; then
+        echo tls
+        return 0
+      fi
+    fi
+    [ "$waited" -lt "$WAIT" ] || { echo none && return 0; }
+    sleep 10
+    waited=$((waited + 10))
+  done
+}
+
+check_endpoint() {
+  local result errors worker
+  say "  Waiting for https://$HOST/session/info to answer 401 (up, and closed to anonymous calls)..."
+  result=$(wait_endpoint)
+  case $result in
+    public)
+      ok "Session endpoint https://$HOST answers"
+      return 0
+      ;;
+    local)
+      note "The endpoint works on this machine, but its public address does not answer from the machine itself"
+      note "(normal on some clouds). From your own computer, open https://$HOST/session/info: it should say 401."
+      return 0
+      ;;
+  esac
+  # The worker answers 401 on its own port once it is up: if it does not, the miner is the problem, not the network
+  worker=$(http_code "$WORKER_URL")
+  [ "$worker" = 401 ] ||
+    die "The miner itself does not answer yet ($WORKER_URL gives ${worker:-nothing}). See what it says: sudo flop-miner logs. Then run the same command again."
+  [ "$MODE" = public ] ||
+    die "The miner works on this machine, but does not answer through the tunnel at https://$HOST yet. Run the same command again in a few minutes."
+  errors=$(tls_errors)
+  [ -z "$errors" ] || printf '%s\n' "$errors" | sed 's/^/    /' >&2
+  say ""
+  say "  The miner works, but the machine could not get its HTTPS certificate: it is probably not reachable from"
+  say "  the internet on ports 80 and 443 (a firewall at your provider), or sslip.io's free certificate quota is used up."
+  [ -x "$BIN" ] ||
+    die "Open ports 80 and 443 (TCP) to this machine in your provider's firewall, then run the same command again."
+  if ask "  Use a free Cloudflare tunnel instead (no port to open)?"; then
+    quiet "Stopping the miner" compose down
+    MODE=tunnel
+    echo tunnel > "$STATE/mode"
+    start_tunnel
+    set_kv SESSION_PUBLIC_HOST "$HOST"
+    quiet "Starting the miner" compose up -d --remove-orphans
+    [ "$(wait_endpoint)" = public ] ||
+      die "The miner does not answer through the tunnel either. See what it says: sudo flop-miner logs"
+    ok "Session endpoint https://$HOST answers (Cloudflare tunnel)"
+    return 0
+  fi
+  die "Open ports 80 and 443 (TCP) to this machine in your provider's firewall, then run the same command again. Or run it with --tunnel."
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# 7. Sponsorship: FLOP's devnet sponsor registers the miner and stakes test FLOP for it (pack README, step 2)
+
+write_sponsor_units() {
+  cat > "$UNITS/flop-miner-sponsor.service" << EOF
+[Unit]
+Description=FLOP miner: ask FLOP's devnet sponsor again
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$BIN sponsor --auto
+EOF
+  cat > "$UNITS/flop-miner-sponsor.timer" << EOF
+[Unit]
+Description=FLOP miner: ask FLOP's devnet sponsor every hour until it registers the miner
+
+[Timer]
+OnActiveSec=1h
+OnUnitActiveSec=1h
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+start_sponsor_timer() {
+  if [ ! -x "$BIN" ]; then
+    note "No automatic retry (the flop-miner command is missing): run sudo bash $0 sponsor later."
+    return 0
+  fi
+  write_sponsor_units
+  if ! { systemctl daemon-reload && systemctl enable --now flop-miner-sponsor.timer; } >> "$LOG" 2>&1; then
+    note "The automatic retry could not start: run sudo flop-miner sponsor later."
+  fi
+}
+stop_sponsor_timer() { systemctl disable --now flop-miner-sponsor.timer >> "$LOG" 2>&1 || true; }
+
+# One request, signed on this machine by the miner account; prints FLOP's HTTP code, or "none" without an answer.
+# sponsor.sh prints "<miner address> <HTTP code> {", then FLOP's JSON answer; without an answer, node's error.
+sponsor_once() {
+  local out code said
+  out=$(run_pack 180 sponsor-request.mjs sponsor.sh 2>&1) || true
+  printf '%s\n' "$out" >> "$LOG"
+  code=$(printf '%s\n' "$out" | sed -nE 's/^[1-9A-HJ-NP-Za-km-z]{46,48} ([0-9]{3})( .*)?$/\1/p' | tail -n 1)
+  said=$(printf '%s\n' "$out" | sed -nE 's/^ *"error": "(.*)",?$/\1/p' | tail -n 1)
+  [ -n "$said" ] || [ -n "$code" ] || said=$(printf '%s\n' "$out" | grep -E 'Error|no answer' | tail -n 1 || true)
+  printf '%s\n' "$said" | cut -c1-240 > "$STATE/sponsor-message"
+  printf '%s %s\n' "$(date -u '+%Y-%m-%d %H:%M UTC')" "${code:-none}" > "$STATE/sponsor-last"
+  echo "${code:-none}"
+}
+
+# handle_sponsor_code CODE ASKED (1 when the user asked, 0 from the timer)
+handle_sponsor_code() {
+  local said
+  said=$(cat "$STATE/sponsor-message" 2> /dev/null || true)
+  case $1 in
+    200 | 201)
+      set_flag sponsored
+      stop_sponsor_timer
+      ok "Sponsored: FLOP registered your miner and staked about 1 million test FLOP for it"
+      # calibration starts with a fresh start of the worker, unless the user stopped the miner
+      if [ ! -f "$STATE/stopped" ]; then
+        compose restart worker >> "$LOG" 2>&1 || note "Could not restart the miner: sudo flop-miner restart"
+      fi
+      ;;
+    409)
+      set_flag sponsored
+      stop_sponsor_timer
+      ok "Already sponsored"
+      ;;
+    429 | 503 | none)
+      if [ "$2" = 1 ] || [ ! -f "$STATE/sponsor-since" ]; then date +%s > "$STATE/sponsor-since"; fi
+      start_sponsor_timer
+      if [ "$1" = none ]; then
+        note "FLOP's devnet sponsor did not answer (network, or FLOP's devnet is busy)."
+      else
+        note "FLOP's devnet sponsor is full right now (HTTP $1): it only takes a few new miners at a time."
+      fi
+      [ -z "$said" ] || note "FLOP says: $said"
+      note "Your miner is installed and keeps running. It asks again every hour, for $SPONSOR_DAYS days."
+      note "Your provider bills the machine meanwhile: follow it with sudo flop-miner status."
+      ;;
+    403 | 422)
+      stop_sponsor_timer
+      note "FLOP did not sponsor this miner (HTTP $1): FLOP has not approved its address, or the operator grant"
+      note "is not valid. The installer stops asking. See $REPO#troubleshooting"
+      [ -z "$said" ] || note "FLOP says: $said"
+      ;;
+    *)
+      note "Unexpected answer from FLOP's sponsor (HTTP $1). Try again later: sudo flop-miner sponsor"
+      ;;
+  esac
+}
+
+sponsorship() { # $1: 1 when the user asked, 0 from the timer
+  local rc=0 since code
+  if flag sponsored; then
+    stop_sponsor_timer
+    [ "$1" = 0 ] || ok "Already sponsored"
+    return 0
+  fi
+  miner_json "$(address)" > /dev/null || rc=$?
+  if [ "$rc" = 0 ]; then
+    set_flag sponsored
+    stop_sponsor_timer
+    ok "Your miner is already registered on FLOP's devnet"
+    return 0
+  fi
+  if [ "$1" = 0 ]; then
+    since=$(cat "$STATE/sponsor-since" 2> /dev/null || echo 0)
+    if [ $(($(date +%s) - since)) -gt $((SPONSOR_DAYS * 86400)) ]; then
+      stop_sponsor_timer
+      echo "automatic sponsorship retry stopped after $SPONSOR_DAYS days" >> "$LOG"
+      return 0
+    fi
+  fi
+  code=$(sponsor_once)
+  # 503: FLOP's pack README says to retry within a minute
+  if [ "$code" = 503 ] && [ "$1" = 1 ]; then
+    sleep 60
+    code=$(sponsor_once)
+  fi
+  handle_sponsor_code "$code" "$1"
+}
+
+refuse_retired() {
+  if flag retired; then
+    die "This miner ($(address)) was retired. FLOP sponsors each account only once: to mine again, start with a new account. Move the old one aside (sudo mv $DIR $DIR.retired), then run the installer again."
+  fi
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# Commands
+
+parse_args() {
+  ARGS=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -y | --yes) ASSUME_YES=1 ;;
+      --tunnel) WANT_TUNNEL=1 ;;
+      --public) WANT_PUBLIC=1 ;;
+      --domain | --grant)
+        [ $# -ge 2 ] || die "$1 needs a value (see: flop-miner help)"
+        if [ "$1" = --domain ]; then WANT_DOMAIN=$2; else WANT_GRANT=$2; fi
+        shift
+        ;;
+      --domain=*) WANT_DOMAIN=${1#*=} ;;
+      --grant=*) WANT_GRANT=${1#*=} ;;
+      *) ARGS+=("$1") ;;
+    esac
+    shift
+  done
+  if [ $((WANT_TUNNEL + WANT_PUBLIC)) -gt 1 ] || { [ -n "$WANT_DOMAIN" ] && [ $((WANT_TUNNEL + WANT_PUBLIC)) -gt 0 ]; }; then
+    die "Use only one of --domain, --tunnel and --public."
+  fi
+  if [ -n "$WANT_DOMAIN" ] && ! valid_name "$WANT_DOMAIN"; then die "Not a valid domain name: $WANT_DOMAIN"; fi
+  return 0
+}
+
+cmd_install() {
+  require_root install
+  [ "${#ARGS[@]}" = 0 ] || die "Unknown option: ${ARGS[0]} (see: flop-miner help)"
+  [ -z "$WANT_GRANT" ] || [ -f "$WANT_GRANT" ] || die "No such file: $WANT_GRANT"
+  log_open install
+  TMP=$(mktemp -d)
+  say "${BOLD}FLOP GPU miner installer $FLOP_MINER_VERSION${RESET} (unofficial: $REPO)"
+
+  step "[1/7] Checking this machine"
+  check_system
+  check_gpu
+  choose_network
+  [ "$MODE" != public ] || check_ports
+  print_plan
+  if ! ask "Continue?"; then
+    say "Cancelled: nothing was changed."
+    exit 0
+  fi
+  install -d -m 700 "$DIR" "$STATE"
+
+  step "[2/7] Installing Docker and the NVIDIA container toolkit"
+  install_deps
+  [ "$MODE" != public ] || open_firewall
+
+  step "[3/7] Downloading FLOP's miner pack"
+  fetch_pack
+
+  step "[4/7] Creating your miner account"
+  create_account
+  refuse_retired
+  install_self
+  [ -z "$WANT_GRANT" ] || save_grant
+
+  step "[5/7] Downloading the model and writing the settings"
+  fetch_model
+  make_session_key
+  if [ "$MODE" = tunnel ]; then
+    echo tunnel > "$STATE/mode"
+    start_tunnel
+  else
+    echo public > "$STATE/mode"
+    stop_tunnel
+  fi
+  write_env
+
+  step "[6/7] Starting the miner"
+  start_stack
+  check_endpoint
+
+  step "[7/7] Asking FLOP's devnet sponsor to register your miner"
+  sponsorship 1
+
+  summary
+}
+
+summary() {
+  local timer
+  timer=$(systemctl is-active flop-miner-sponsor.timer 2> /dev/null) || timer=''
+  say ""
+  say "${BOLD}${GREEN}Your FLOP miner is installed and running.${RESET}"
+  say ""
+  row "Miner address" "$(address)"
+  row "Session endpoint" "https://$(envget SESSION_PUBLIC_HOST)"
+  if flag sponsored; then
+    row "Sponsorship" "done: calibration starts by itself and can take a day"
+  elif [ "$timer" = active ]; then
+    row "Sponsorship" "waiting for a free slot: asked again every hour"
+  else
+    row "Sponsorship" "not done (see above)"
+  fi
+  say ""
+  say "Next:"
+  say "  1. Write down your secret phrase now:  sudo flop-miner backup"
+  say "  2. Check progress at any time:         sudo flop-miner status"
+  say "  3. See the devnet's miners:            $EXPLORER/mining"
+  say ""
+  say "Keep the machine running while you mine: FLOP penalizes calibration jobs left unanswered."
+  say "To stop for good: sudo flop-miner retire, then delete the machine at your provider (it bills until deleted)."
+}
+
+cmd_status() {
+  require_root status
+  require_installed
+  local addr host code endpoint json rc=0 containers last timer since gpu
+  addr=$(address)
+  host=$(envget SESSION_PUBLIC_HOST)
+  say "${BOLD}FLOP GPU miner${RESET}, $(date -u '+%Y-%m-%d %H:%M UTC') (flop-miner $FLOP_MINER_VERSION)"
+  say ""
+  row "Miner address" "$addr"
+  code=$(http_code "https://$host/session/info")
+  if [ "$code" != 401 ] && [ "$(mode)" = public ] &&
+    [ "$(http_code --resolve "$host:443:127.0.0.1" "https://$host/session/info")" = 401 ]; then
+    code=local
+  fi
+  case $code in
+    401) endpoint="up (answers 401, as it should)" ;;
+    local) endpoint="answers on this machine; check from your computer that https://$host/session/info says 401" ;;
+    000 | '') endpoint="does not answer" ;;
+    *) endpoint="answers HTTP $code instead of 401" ;;
+  esac
+  row "Session endpoint" "https://$host: $endpoint"
+  [ "$(mode)" != tunnel ] || row "" "through a Cloudflare tunnel"
+  # gpu-inventory is a one-shot probe of the pack: it exits once it has listed the GPUs
+  containers=$(compose ps -a --format '{{.Service}} {{.State}} {{.Health}}' 2> /dev/null | awk '
+    $1 == "gpu-inventory" && $2 == "exited" { next }
+    { s = $1 ": " $2; if ($3 != "") s = s " (" $3 ")"; printf "%s%s", (n++ ? ", " : ""), s }') || containers=''
+  if [ -f "$STATE/stopped" ]; then
+    row "Containers" "stopped by you (start again: sudo flop-miner restart)"
+  else
+    row "Containers" "${containers:-none running (sudo flop-miner restart)}"
+  fi
+  json=$(miner_json "$addr") || rc=$?
+  case $rc in
+    0)
+      row "FLOP devnet" "$(jq -r '"registered at block \(.registeredBlock), \((.sponsoredStake // "0" | tonumber) / 1e18 | floor) test FLOP of sponsored stake"' <<< "$json")"
+      row "Calibration" "$(jq -r 'if .calibration then "\(.calibration.phase): \(.calibrationReport.verifiedJobs // "?") jobs verified, \(.calibration.gnMax) GFLOP/s" else "in progress (\(.calibrationReport.verifiedJobs // 0) jobs verified so far; it can take a day)" end' <<< "$json")"
+      [ "$(jq -r '.strikes // 0' <<< "$json")" = 0 ] || row "Strikes" "$(jq -r '.strikes' <<< "$json") (calibration jobs missed or failed)"
+      ;;
+    1) row "FLOP devnet" "not registered yet" ;;
+    *) row "FLOP devnet" "the explorer does not answer right now" ;;
+  esac
+  if flag retired; then
+    row "Sponsorship" "retired: delete the machine at your provider"
+  elif flag sponsored; then
+    row "Sponsorship" "done"
+  else
+    last=$(cat "$STATE/sponsor-last" 2> /dev/null) || last=''
+    timer=$(systemctl is-active flop-miner-sponsor.timer 2> /dev/null) || timer=''
+    since=$(cat "$STATE/sponsor-since" 2> /dev/null || echo 0)
+    row "Sponsorship" "not yet${last:+ (last answer: HTTP ${last##* } on ${last% *})}"
+    if [ "$timer" = active ]; then
+      row "" "asked again automatically every hour"
+    elif [ "$since" != 0 ] && [ $(($(date +%s) - since)) -gt $((SPONSOR_DAYS * 86400)) ]; then
+      row "" "automatic retry stopped after $SPONSOR_DAYS days: sudo flop-miner sponsor, or delete the machine"
+    else
+      row "" "ask again with: sudo flop-miner sponsor"
+    fi
+  fi
+  gpu=$(nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader 2> /dev/null | sed -n 1p) || gpu=''
+  row "GPU" "${gpu:-nvidia-smi does not answer}"
+  say ""
+  say "Explorer: $EXPLORER/mining    Logs: sudo flop-miner logs"
+}
+
+cmd_restart() {
+  require_root restart
+  require_installed
+  refuse_retired
+  log_open restart
+  if [ "$(mode)" = tunnel ]; then
+    systemctl start flop-miner-tunnel.service flop-miner-sync.timer >> "$LOG" 2>&1 || true
+    HOST=$(tunnel_host 60) || die "The Cloudflare tunnel gives no address (see $STATE/tunnel.log)."
+    set_kv SESSION_PUBLIC_HOST "$HOST"
+  fi
+  start_stack --force-recreate
+  ok "Restarted. Check it with: sudo flop-miner status"
+  flag sponsored || sponsorship 1
+}
+
+cmd_stop() {
+  require_root stop
+  require_installed
+  note "While it is stopped, the miner cannot answer FLOP's calibration jobs, and unanswered jobs are penalized."
+  note "To quit for good, use sudo flop-miner retire instead."
+  ask "Stop the miner?" || return 0
+  log_open stop
+  touch "$STATE/stopped"
+  quiet "Stopping the miner" compose stop
+  ok "Stopped. Start it again with: sudo flop-miner restart (your provider still bills the machine)"
+}
+
+cmd_sponsor() {
+  require_root sponsor
+  require_installed
+  refuse_retired
+  log_open sponsor "${ARGS[*]:-}"
+  if [ "${ARGS[0]:-}" = --auto ]; then sponsorship 0; else sponsorship 1; fi
+}
+
+cmd_backup() {
+  require_root backup
+  require_installed
+  say "These secrets give full control of your miner account. Write them down offline (on paper, or in a"
+  say "password manager). Never paste them into a chat, a form or a website: FLOP and this guide never ask for them."
+  if ! confirm_word SHOW "Show them now?"; then
+    say "Cancelled."
+    return 0
+  fi
+  say ""
+  row "Miner address" "$(address)"
+  row "Secret phrase" "$(cat "$DIR/signer")"
+  row "Session seed" "$(cat "$DIR/session-keys/enclave.seed" 2> /dev/null || echo missing)"
+  say ""
+  say "Then type clear, so that they do not stay on the screen. To move the miner to another machine, copy these"
+  say "files there (root only), then run the installer:"
+  say "  $DIR/miner-key.json  $DIR/signer  $DIR/session-keys/enclave.seed  $DIR/miner.env"
+}
+
+cmd_retire() {
+  require_root retire
+  require_installed
+  log_open retire
+  local addr rc=0 out
+  addr=$(address)
+  say "Retiring deregisters your miner from FLOP's devnet: its sponsored stake unbonds over 7 days and goes back"
+  say "to the sponsor. Do it when you stop mining, then delete the machine at your provider."
+  if ! confirm_word RETIRE "Retire the miner $addr?"; then
+    say "Cancelled."
+    return 0
+  fi
+  stop_sponsor_timer
+  stop_tunnel
+  touch "$STATE/stopped"
+  quiet "Stopping the miner" compose down
+  # retire.sh checks the chain itself ("not a registered miner; nothing to retire") and waits up to 10 minutes
+  # for the chain to finalize the call
+  out=$(run_pack 900 retire.mjs retire.sh 2>&1) || rc=$?
+  printf '%s\n' "$out" | tee -a "$LOG" | sed 's/^/  /'
+  if [ "$rc" = 0 ]; then
+    set_flag retired
+    rm -f "$STATE/sponsored"
+    ok "Done. You can now delete the machine at your provider (it bills until deleted)."
+  else
+    die "The retirement did not go through (see FLOP's answer above). The miner is stopped: run sudo flop-miner retire again later."
+  fi
+}
+
+cmd_uninstall() {
+  require_root uninstall
+  local rc=0
+  if [ -s "$DIR/address" ] && ! flag retired; then
+    miner_json "$(address)" > /dev/null || rc=$?
+  else
+    rc=1
+  fi
+  if [ "$rc" = 0 ]; then
+    note "Your miner is still registered on FLOP's devnet: retire it first (sudo flop-miner retire), or FLOP"
+    note "penalizes the calibration jobs it no longer answers. After uninstall, the retire command is gone."
+    if ! confirm_word REMOVE "Remove it anyway?"; then
+      say "Cancelled."
+      return 0
+    fi
+  elif ! ask "Remove the miner's containers, timers and the flop-miner command? Your keys stay in $DIR."; then
+    say "Cancelled."
+    return 0
+  fi
+  log_open uninstall
+  if [ -f "$DIR/miner.env" ]; then compose down >> "$LOG" 2>&1 || true; fi
+  systemctl disable --now flop-miner-sponsor.timer flop-miner-sync.timer flop-miner-tunnel.service >> "$LOG" 2>&1 || true
+  rm -f "$UNITS"/flop-miner-*.service "$UNITS"/flop-miner-*.timer
+  systemctl daemon-reload >> "$LOG" 2>&1 || true
+  rm -f "$BIN"
+  ok "Removed. Docker, the NVIDIA toolkit and your keys stay; the keys are in $DIR."
+  say "Once the miner is retired and your secrets are written down, you can delete them too: sudo rm -rf $DIR"
+}
+
+# Run every two minutes in tunnel mode: gives the worker the tunnel's new address. A miner the user stopped or
+# retired stays stopped: only the settings follow.
+cmd_tunnel_sync() {
+  local host
+  [ "$(mode)" = tunnel ] && [ -f "$DIR/miner.env" ] || return 0
+  host=$(tunnel_host 0) || return 0
+  [ "$host" != "$(envget SESSION_PUBLIC_HOST)" ] || return 0
+  log_open tunnel-sync "$host"
+  set_kv SESSION_PUBLIC_HOST "$host"
+  [ ! -f "$STATE/stopped" ] || return 0
+  compose up -d --pull never --remove-orphans >> "$LOG" 2>&1 || true
+}
+
+cmd_help() {
+  cat << EOF
+flop-miner $FLOP_MINER_VERSION: a FLOP devnet GPU miner on one machine, in one command (unofficial)
+
+  sudo bash flop-miner install [options]   install, or repair (safe to run again)
+      --domain NAME   your own domain name, whose A record points to this machine
+      --tunnel        a free Cloudflare tunnel instead of ports 80 and 443
+      --public        back to ports 80 and 443 with <ip>.sslip.io, after the tunnel
+      --grant FILE    a sponsorship grant from an approved FLOP operator
+      --yes           answer yes to every question
+  sudo flop-miner status      miner, endpoint, devnet and sponsorship at a glance
+  sudo flop-miner logs        follow the miner's logs (Ctrl+C to quit)
+  sudo flop-miner restart     check the decode policy, update FLOP's images, restart everything
+  sudo flop-miner stop        stop the miner (it stays installed)
+  sudo flop-miner sponsor     ask FLOP's devnet sponsor again, until the miner is sponsored
+  sudo flop-miner backup      show the secrets to write down
+  sudo flop-miner retire      deregister the miner, before you delete the machine
+  sudo flop-miner uninstall   remove the miner from this machine (keeps the keys)
+
+Guide: $REPO
+EOF
+}
+
+main() {
+  local cmd=${1:-help}
+  [ $# = 0 ] || shift
+  parse_args "$@"
+  case $cmd in
+    install) cmd_install ;;
+    status) cmd_status ;;
+    logs)
+      require_root logs
+      require_installed
+      compose logs -f --tail 100 "${ARGS[@]}"
+      ;;
+    restart) cmd_restart ;;
+    stop) cmd_stop ;;
+    sponsor) cmd_sponsor ;;
+    backup) cmd_backup ;;
+    retire) cmd_retire ;;
+    uninstall) cmd_uninstall ;;
+    tunnel-sync) cmd_tunnel_sync ;;
+    version | --version) say "flop-miner $FLOP_MINER_VERSION (FLOP pack $PACK_NAME)" ;;
+    help | -h | --help) cmd_help ;;
+    *)
+      cmd_help >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
