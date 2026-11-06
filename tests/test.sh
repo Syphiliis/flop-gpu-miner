@@ -6,7 +6,10 @@
 #   bash tests/test.sh <path of flop-miner>        exit 0 when every check passes
 set -uo pipefail
 SCRIPT=$(readlink -f "${1:?usage: test.sh <path of flop-miner>}")
-[ "$(id -u)" = 0 ] && [ -f /.dockerenv ] || { echo "run it as root in a throwaway container: tests/run.sh"; exit 2; }
+if [ "$(id -u)" != 0 ] || [ ! -f /.dockerenv ]; then
+  echo "run it as root in a throwaway container: tests/run.sh"
+  exit 2
+fi
 if ! command -v jq > /dev/null || ! command -v openssl > /dev/null || ! command -v ss > /dev/null; then
   apt-get update -qq > /dev/null && apt-get install -y -qq jq openssl iproute2 > /dev/null
 fi
@@ -158,10 +161,20 @@ fake uname << 'EOF'
 case $1 in -m) echo x86_64 ;; -r) echo 6.8.0-fake ;; *) echo Linux ;; esac
 EOF
 
-printf '#!/bin/bash\necho "apt-get $*" >> "$FAKE_CALLS"\n' | fake apt-get
+fake apt-get << 'EOF'
+#!/bin/bash
+echo "apt-get $*" >> "$FAKE_CALLS"
+EOF
 printf '#!/bin/bash\nexit 0\n' | fake gpg
-printf '#!/bin/bash\necho "sleep $*" >> "$FAKE_CALLS"\n' | fake sleep
-printf '#!/bin/bash\necho "nvidia-ctk $*" >> "$FAKE_CALLS"\nrm -f "$FAKE_STATE/no-nvidia"\n' | fake nvidia-ctk
+fake sleep << 'EOF'
+#!/bin/bash
+echo "sleep $*" >> "$FAKE_CALLS"
+EOF
+fake nvidia-ctk << 'EOF'
+#!/bin/bash
+echo "nvidia-ctk $*" >> "$FAKE_CALLS"
+rm -f "$FAKE_STATE/no-nvidia"
+EOF
 
 # --- fake FLOP packs: the real pack's file names; its scripts mimic the real ones -------------------------------
 make_pack() { # make_pack OUTPUT MODEL_HASH
