@@ -10,14 +10,24 @@
 set -Eeuo pipefail
 umask 022
 
-readonly FLOP_MINER_VERSION=0.1.0
+readonly FLOP_MINER_VERSION=0.1.1
 readonly REPO=https://github.com/Syphiliis/flop-gpu-miner
 
-# Pinned inputs, checked on 2026-11-05. A fingerprint is written as four groups of 16 hex characters.
+# Pinned inputs, checked on 2026-11-08. A fingerprint is written as four groups of 16 hex characters.
 # FLOP's public miner pack, and its fingerprint as published on https://flop.network/skills/flop-miner-devnet/SKILL.md
-readonly PACK_NAME=flop-miner-pack-devnet-ts-20261103c
+# and https://docs.flop.network/docs/run-miner
+readonly PACK_NAME=flop-miner-pack-devnet-ts-20261106
 readonly PACK_URL=${FLOP_MINER_PACK_URL:-https://flop.network/releases/cli/$PACK_NAME/$PACK_NAME.tar.gz}
-readonly PACK_SHA256=${FLOP_MINER_PACK_SHA256:-"0e590e50d995a6f5 c79edb732523a3c0 b156b4a231432abd ef8a77d4e4a86b10"}
+readonly PACK_SHA256=${FLOP_MINER_PACK_SHA256:-"35f222f748447a8a abdd015d94260d8f acfd29305691c3cf 7ed033cbb2b514b1"}
+# FLOP's images, by version and digest: FLOP's miner guide says to use "version-and-digest-qualified references" and
+# "do not use floating stable or latest tags", while the pack's miner.env.example names the :stable tags. These are the
+# images that :stable named on 2026-11-08 (the latest versions of https://flop.network/releases.json); digests from GHCR.
+readonly CLI_IMAGE=ghcr.io/flop-labs/flop-core/cli:v0.1.220
+readonly CLI_DIGEST="c8f3456c48d41cec 9d0229d1e1dd9eb8 d6247a22f350c510 78d85f129601bbbd"
+readonly WORKER_IMAGE=ghcr.io/flop-labs/flop-core/miner-worker:v0.1.286
+readonly WORKER_DIGEST="78211fe5f63820ee b1191e834f3a1eb7 f573bc34348bdd4c 0b0f07c7824fe7b5"
+readonly BACKEND_IMAGE=ghcr.io/flop-labs/flop-core/miner-vllm-toploc:v0.1.239
+readonly BACKEND_DIGEST="9b6c6dfc4d77ac37 583d28dbfdcb4fa9 6207ae95956c1e85 9b7d5e9eef6f7b9e"
 # The image the pack README uses to create the miner account (step 1), pinned by its digest
 readonly KEYGEN_IMAGE=ghcr.io/flop-labs/flop-core/node-devnet:sha-eea56e7
 readonly KEYGEN_DIGEST="61f1eebdc5ba2e58 ebf51881e10a80d3 03a7c31700ef376e d245efd0e6330259"
@@ -42,11 +52,13 @@ readonly BIN=/usr/local/bin/flop-miner
 readonly UNITS=/etc/systemd/system
 readonly LOG=/var/log/flop-miner.log
 readonly EXPLORER=https://explorer.devnet.flop.network
+readonly FAUCET=https://faucet.flop.network             # FLOP's sponsor; its /limits page says when to ask
 readonly WORKER_URL=http://127.0.0.1:8645/session/info # the worker's session port, on this machine only
 readonly SPONSOR_DAYS=7                                 # the automatic sponsorship retry stops after this many days
 readonly WAIT=${FLOP_MINER_WAIT:-600}                   # seconds to wait for the session endpoint
 
 ASSUME_YES=0 WANT_DOMAIN='' WANT_TUNNEL=0 WANT_PUBLIC=0 WANT_GRANT='' MODE=public HOST='' TMP='' PACK_CHANGED=0
+REGISTERED_BLOCK='?'
 ARGS=() PACK_ENV=()
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -126,6 +138,16 @@ set_kv() {
   fi
 }
 address() { if [ -s "$DIR/address" ]; then cat "$DIR/address"; fi; }
+pinned() { printf '%s@sha256:%s' "$1" "${2// /}"; } # pinned IMAGE:VERSION DIGEST
+now_utc() { date -u '+%Y-%m-%d %H:%M UTC'; }
+# What this machine knows of the account's sponsorship and retirement: cleared for a new account
+forget_sponsorship() {
+  local f
+  for f in sponsored sponsored-on retired retired-on sponsor-since sponsor-last sponsor-message sponsor-action \
+    sponsor-not-before sponsor-limits sponsor-stopped; do
+    rm -f "$STATE/$f"
+  done
+}
 # A state flag holds the address it was written for: a flag of another account means nothing for this one
 flag() { [ -s "$STATE/$1" ] && [ "$(cat "$STATE/$1")" = "$(address)" ]; }
 set_flag() { address > "$STATE/$1"; }
@@ -169,7 +191,7 @@ miner_json() {
 # scripts run node in FLOP's CLI image, which waits without end when FLOP's RPC does not answer and ignores the
 # stop signal: past the limit, the container left behind (the one that mounts MJS, and only it) is removed.
 run_pack() {
-  local limit=$1 mjs=$2 script=$3 rc=0 v cli ids=()
+  local limit=$1 mjs=$2 script=$3 rc=0 v cli id ids=()
   shift 3
   PACK_ENV=(MINER_SIGNER_FILE="$DIR/signer")
   for v in FLOP_CLI FLOP_RPC; do [ -z "$(envget "$v")" ] || PACK_ENV+=("$v=$(envget "$v")"); done
@@ -177,8 +199,10 @@ run_pack() {
   (cd "$DIR" && env "${PACK_ENV[@]}" timeout -k 10 "$limit" "./$script" "$@") || rc=$?
   if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
     cli=$(envget FLOP_CLI)
-    mapfile -t ids < <(docker ps -aq --filter "ancestor=${cli:-ghcr.io/flop-labs/flop-core/cli:stable}" \
-      --filter "volume=/app/$mjs" 2> /dev/null || true)
+    cli=${cli:-$(pinned "$CLI_IMAGE" "$CLI_DIGEST")}
+    # matched by image ID, whatever the form of the reference (tag, digest, or both)
+    id=$(docker image inspect --format '{{.Id}}' "$cli" 2> /dev/null) || id=''
+    mapfile -t ids < <(docker ps -aq --filter "ancestor=${id:-$cli}" --filter "volume=/app/$mjs" 2> /dev/null || true)
     [ "${#ids[@]}" = 0 ] || docker rm -f "${ids[@]}" > /dev/null 2>&1 || true
     echo "$script: no answer from FLOP's devnet within $limit seconds"
   fi
@@ -367,7 +391,7 @@ print_plan() {
   else
     say "  - serve the miner's HTTPS endpoint through a free Cloudflare tunnel"
   fi
-  say "  - ask FLOP's devnet sponsor to register your miner, and retry every hour while it is full"
+  say "  - ask FLOP's devnet sponsor to register your miner, once FLOP's limits say it is open (checked every hour)"
   say ""
   say "This is FLOP's devnet: test FLOP has no value, and there are no earnings and no airdrop."
   say "Your provider bills the GPU machine for as long as it exists."
@@ -509,7 +533,7 @@ create_account() {
       die "Could not create the miner account (see $LOG). Run the same command again."
     fi
     # A new account starts with no sponsorship and no retirement
-    rm -f "$STATE/sponsored" "$STATE/retired" "$STATE/sponsor-since" "$STATE/sponsor-last" "$STATE/sponsor-message"
+    forget_sponsorship
     ok "Miner account created on this machine"
   else
     ok "Existing miner account kept"
@@ -531,7 +555,7 @@ create_account() {
       die "$DIR/miner-key.json and $DIR/signer are two different accounts. Keep the right one (the other may be a backup), then run the same command again."
   fi
   if [ -n "$known" ] && [ "$known" != "$addr" ]; then
-    rm -f "$STATE/sponsored" "$STATE/retired" "$STATE/sponsor-since" "$STATE/sponsor-last" "$STATE/sponsor-message"
+    forget_sponsorship
     note "The miner account changed: it was $known, it is now $addr (restored from another backup?)."
   fi
   printf '%s\n' "$addr" > "$DIR/address"
@@ -559,6 +583,7 @@ save_grant() {
   jq -e --arg a "$addr" '.role == "miner" and .account == $a' "$WANT_GRANT" > /dev/null 2>&1 ||
     die "$WANT_GRANT is not a grant for this miner: it must be a miner grant for $addr, made with the pack's sponsor-grant.sh."
   [ "$WANT_GRANT" -ef "$DIR/grant.json" ] || install -m 644 -- "$WANT_GRANT" "$DIR/grant.json"
+  rm -f "$STATE/sponsor-stopped" # a grant changes the request: FLOP may say yes to it
   ok "Operator grant saved: it goes with the sponsorship request"
 }
 
@@ -594,7 +619,7 @@ make_session_key() {
 
 # miner.env, from the pack's miner.env.example (README, step 3). The miner's own values (the two tokens and the
 # public name) are kept across runs; when the pack changes, every other setting comes from the new pack, and the
-# decode policy is taken again.
+# decode policy is taken again. FLOP's three images are always this installer's pins, by version and digest.
 write_env() {
   local env=$DIR/miner.env key line keep=()
   if [ -f "$env" ] && [ "$PACK_CHANGED" = 1 ]; then
@@ -611,6 +636,9 @@ write_env() {
     key=${line%%=*}
     grep -q "^$key=" "$env" || printf '%s\n' "$line" >> "$env"
   done < <(grep -E '^[A-Z][A-Z0-9_]*=' "$DIR/miner.env.example" || true)
+  set_kv FLOP_CLI "$(pinned "$CLI_IMAGE" "$CLI_DIGEST")"
+  set_kv FLOP_WORKER_IMAGE "$(pinned "$WORKER_IMAGE" "$WORKER_DIGEST")"
+  set_kv FLOP_BACKEND_IMAGE "$(pinned "$BACKEND_IMAGE" "$BACKEND_DIGEST")"
   for key in INFERENCE_API_KEY SESSION_AUTH_TOKEN; do
     [ -n "$(envget "$key")" ] || set_kv "$key" "$(openssl rand -hex 32)"
   done
@@ -805,12 +833,15 @@ check_endpoint() {
 }
 
 # ---------------------------------------------------------------------------------------------------------------
-# 7. Sponsorship: FLOP's devnet sponsor registers the miner and stakes test FLOP for it (pack README, step 2)
+# 7. Sponsorship: FLOP's devnet sponsor registers the miner and stakes test FLOP for it (pack README, step 2).
+# FLOP's miner guide and skill: read /limits first, ask only when sponsor.miner.status is "open", never retry in a
+# loop (wait at least retryAfterSeconds on retry_later; on report_to_operator, stop and report error and reason).
+# Here: one request at a time, and only then; otherwise a timer looks again every hour, for SPONSOR_DAYS days.
 
 write_sponsor_units() {
   cat > "$UNITS/flop-miner-sponsor.service" << EOF
 [Unit]
-Description=FLOP miner: ask FLOP's devnet sponsor again
+Description=FLOP miner: look at FLOP's devnet sponsor, and ask it once it is open
 After=network-online.target docker.service
 Wants=network-online.target
 
@@ -820,7 +851,7 @@ ExecStart=$BIN sponsor --auto
 EOF
   cat > "$UNITS/flop-miner-sponsor.timer" << EOF
 [Unit]
-Description=FLOP miner: ask FLOP's devnet sponsor every hour until it registers the miner
+Description=FLOP miner: look at FLOP's devnet sponsor every hour until it registers the miner
 
 [Timer]
 OnActiveSec=1h
@@ -843,65 +874,226 @@ start_sponsor_timer() {
 }
 stop_sponsor_timer() { systemctl disable --now flop-miner-sponsor.timer >> "$LOG" 2>&1 || true; }
 
+# FLOP's live limits (GET /limits, refreshed about once a minute): prints sponsor.miner.status, "open" when a new
+# request should work, or "unreadable"; keeps it with its reason for status.
+limits_status() {
+  local json status reason re='^[A-Za-z0-9_.: -]{1,80}$'
+  json=$(curl -fsS --max-time 20 "$FAUCET/limits" 2> /dev/null) || json=''
+  status=$(jq -r '.sponsor.miner.status // empty' <<< "$json" 2> /dev/null) || status=''
+  reason=$(jq -r '.sponsor.miner.reason // empty' <<< "$json" 2> /dev/null) || reason=''
+  [[ $status =~ ^[A-Za-z0-9_-]{1,40}$ ]] || status=unreadable
+  [[ $reason =~ $re ]] || reason=''
+  printf '%s|%s|%s\n' "$(now_utc)" "$status" "$reason" > "$STATE/sponsor-limits"
+  echo "$status"
+}
+
+# The devnet's latest sponsored registrations, whichever sponsor account signed them (FLOP rotates them): prints
+# "failing" when the last ones all failed on the chain, as from 5 to 7 November 2026 (1 290 failed registrations for
+# 39 accounts, while /limits could read "open"); "ok" otherwise, or when the explorer does not answer.
+sponsor_chain() {
+  local json verdict
+  json=$(curl -fsS --max-time 30 \
+    "$EXPLORER/api/transactions?section=minerStaking&limit=50&sortBy=timestamp&sortOrder=desc" 2> /dev/null) || json=''
+  verdict=$(jq -r '[.data[]? | select(.method == "sponsorRegisterMiner")] | sort_by(.timestamp) | .[-5:]
+    | if length >= 3 and all(.success != true) then "failing" else "ok" end' <<< "$json" 2> /dev/null) || verdict=''
+  echo "${verdict:-ok}"
+}
+
+# Why not ask FLOP's sponsor now: "stopped" (FLOP refused this miner: only `sudo flop-miner sponsor` or a new grant
+# asks again), "wait" (FLOP's retryAfterSeconds not over), "full", "closed" or "failing"; nothing when a request
+# should work. A request with an operator's grant goes past a full automatic cap or daily limit (pack README).
+ask_blocker() {
+  local nb status
+  if [ -s "$STATE/sponsor-stopped" ]; then
+    echo stopped
+    return 0
+  fi
+  nb=$(cat "$STATE/sponsor-not-before" 2> /dev/null || echo 0)
+  [[ $nb =~ ^[0-9]+$ ]] || nb=0
+  if [ "$(date +%s)" -lt "$nb" ]; then
+    echo wait
+    return 0
+  fi
+  status=$(limits_status)
+  case $status in
+    open) ;;
+    automatic_full | daily_limit_reached) [ -f "$DIR/grant.json" ] || { echo full && return 0; } ;;
+    *) echo closed && return 0 ;;
+  esac
+  [ "$(sponsor_chain)" = ok ] || echo failing
+}
+
+waiting_note() {
+  note "Your miner is installed and keeps running. It looks at FLOP's sponsor every hour and asks once it is open,"
+  note "for $SPONSOR_DAYS days. Your provider bills the machine meanwhile: follow it with sudo flop-miner status."
+}
+
+explain_blocker() {
+  local when='' status='' reason='' nb
+  if [ -f "$STATE/sponsor-limits" ]; then IFS='|' read -r when status reason < "$STATE/sponsor-limits" || true; fi
+  nb=$(cat "$STATE/sponsor-not-before" 2> /dev/null || echo 0)
+  [[ $nb =~ ^[0-9]+$ ]] || nb=0
+  case $1 in
+    wait) note "FLOP asked to wait until $(date -u -d "@$nb" '+%Y-%m-%d %H:%M UTC') before asking again." ;;
+    stopped)
+      note "FLOP refused this miner earlier ($(cat "$STATE/sponsor-stopped" 2> /dev/null || true)): the installer does not"
+      note "ask again by itself. To ask once more: sudo flop-miner sponsor. See $REPO#troubleshooting"
+      return 0
+      ;;
+    full)
+      note "FLOP's devnet sponsor is full right now (its limits page says $status): it takes new miners again when one"
+      note "of those it sponsored is calibrated, or after its daily limit."
+      ;;
+    failing)
+      note "FLOP's sponsor failed its latest registrations on the devnet: a request now could use up this miner's"
+      note "only sponsorship without registering it."
+      ;;
+    *)
+      if [ "$status" = unreadable ]; then
+        note "FLOP's limits page ($FAUCET/limits) does not answer right now."
+      else
+        note "FLOP's limits page does not say that the sponsor is open (it says ${status}${reason:+, $reason})."
+      fi
+      note "FLOP asks to send a request only when it says open."
+      ;;
+  esac
+  waiting_note
+}
+
 # One request, signed on this machine by the miner account; prints FLOP's HTTP code, or "none" without an answer.
 # sponsor.sh prints "<miner address> <HTTP code> {", then FLOP's JSON answer; without an answer, node's error.
+# A refusal carries error, reason, action (retry_later, fix_request, report_to_operator) and retryAfterSeconds.
 sponsor_once() {
-  local out code said
+  local out code json err reason action wait said
   out=$(run_pack 180 sponsor-request.mjs sponsor.sh 2>&1) || true
   printf '%s\n' "$out" >> "$LOG"
   code=$(printf '%s\n' "$out" | sed -nE 's/^[1-9A-HJ-NP-Za-km-z]{46,48} ([0-9]{3})( .*)?$/\1/p' | tail -n 1)
-  said=$(printf '%s\n' "$out" | sed -nE 's/^ *"error": "(.*)",?$/\1/p' | tail -n 1)
+  # FLOP's JSON answer: from the "{" after the code to the first line that is "}" alone
+  json=$(printf '%s\n' "$out" | sed -nE '/^[1-9A-HJ-NP-Za-km-z]{46,48} [0-9]{3} \{/,/^\}$/p' | sed -E '1s/^[^{]*//')
+  err=$(jq -r '.error // empty' <<< "$json" 2> /dev/null | head -n 1) || err=''
+  reason=$(jq -r '.reason // empty' <<< "$json" 2> /dev/null | head -n 1) || reason=''
+  action=$(jq -r '.action // empty' <<< "$json" 2> /dev/null | head -n 1) || action=''
+  wait=$(jq -r '.retryAfterSeconds // empty' <<< "$json" 2> /dev/null | head -n 1) || wait=''
+  said=$err${reason:+ ($reason)}
   [ -n "$said" ] || [ -n "$code" ] || said=$(printf '%s\n' "$out" | grep -E 'Error|no answer' | tail -n 1 || true)
   printf '%s\n' "$said" | cut -c1-240 > "$STATE/sponsor-message"
-  printf '%s %s\n' "$(date -u '+%Y-%m-%d %H:%M UTC')" "${code:-none}" > "$STATE/sponsor-last"
+  [[ $action =~ ^[a-z_]{1,40}$ ]] || action=''
+  printf '%s\n' "$action" > "$STATE/sponsor-action"
+  if [[ $wait =~ ^[0-9]{1,7}$ ]] && [ "$wait" -gt 0 ]; then
+    echo $(($(date +%s) + wait)) > "$STATE/sponsor-not-before"
+  else
+    rm -f "$STATE/sponsor-not-before"
+  fi
+  printf '%s %s\n' "$(now_utc)" "${code:-none}" > "$STATE/sponsor-last"
   echo "${code:-none}"
 }
 
-# handle_sponsor_code CODE ASKED (1 when the user asked, 0 from the timer)
+# After FLOP's yes: is the miner on FLOP's explorer? It shows within a few blocks: looked at for up to two minutes.
+# Sets REGISTERED_BLOCK.
+confirm_registered() {
+  local json='' waited=0
+  REGISTERED_BLOCK='?'
+  while :; do
+    if json=$(miner_json "$(address)"); then
+      REGISTERED_BLOCK=$(jq -r '.registeredBlock // "?"' <<< "$json" 2> /dev/null) || REGISTERED_BLOCK='?'
+      return 0
+    fi
+    [ "$waited" -lt 120 ] || return 1
+    sleep 10
+    waited=$((waited + 10))
+  done
+}
+
+# Calibration starts with a fresh start of the worker, unless the user stopped the miner
+restart_worker() {
+  [ ! -f "$STATE/stopped" ] || return 0
+  compose restart worker >> "$LOG" 2>&1 || note "Could not restart the miner: sudo flop-miner restart"
+}
+
+# A refusal that FLOP does not want retried as it is: no automatic request any more for this account
+sponsor_refused() { # CODE ACTION SAID
+  stop_sponsor_timer
+  echo "HTTP $1${2:+, $2}" > "$STATE/sponsor-stopped"
+  note "FLOP did not sponsor this miner (HTTP $1${2:+, $2}): FLOP has not approved its address, the operator grant"
+  note "is not valid, or FLOP asks for a person to look at it. The installer stops asking. See $REPO#troubleshooting"
+  [ -z "$3" ] || note "FLOP says: $3"
+}
+
+sponsor_wait() { # CODE ASKED SAID
+  local nb
+  if [ "$2" = 1 ] || [ ! -f "$STATE/sponsor-since" ]; then date +%s > "$STATE/sponsor-since"; fi
+  start_sponsor_timer
+  case $1 in
+    none) note "FLOP's devnet sponsor did not answer (network, or FLOP's devnet is busy)." ;;
+    429)
+      note "FLOP's devnet sponsor is full right now (HTTP 429): it takes new miners again when one of those it"
+      note "sponsored is calibrated, or after its daily limit."
+      ;;
+    *) note "FLOP's devnet sponsor is unavailable right now (HTTP $1): FLOP says to retry later." ;;
+  esac
+  [ -z "$3" ] || note "FLOP says: $3"
+  nb=$(cat "$STATE/sponsor-not-before" 2> /dev/null) || nb=''
+  [[ ! $nb =~ ^[0-9]+$ ]] || note "FLOP asks to wait until $(date -u -d "@$nb" '+%Y-%m-%d %H:%M UTC') before asking again."
+  waiting_note
+}
+
+# handle_sponsor_code CODE ASKED (1 when the user asked, 0 from the timer). FLOP's own action comes first: on
+# fix_request and report_to_operator, stop; then the code. A gateway in front of FLOP's sponsor may answer a 5xx of
+# its own, without FLOP's JSON: that is a "retry later" too.
 handle_sponsor_code() {
-  local said
+  local said action
   said=$(cat "$STATE/sponsor-message" 2> /dev/null || true)
+  action=$(cat "$STATE/sponsor-action" 2> /dev/null || true)
+  if [ "$action" = fix_request ] || [ "$action" = report_to_operator ]; then
+    sponsor_refused "$1" "$action" "$said"
+    return 0
+  fi
   case $1 in
     200 | 201)
       set_flag sponsored
+      now_utc > "$STATE/sponsored-on"
       stop_sponsor_timer
-      ok "Sponsored: FLOP registered your miner and staked about 1 million test FLOP for it"
-      # calibration starts with a fresh start of the worker, unless the user stopped the miner
-      if [ ! -f "$STATE/stopped" ]; then
-        compose restart worker >> "$LOG" 2>&1 || note "Could not restart the miner: sudo flop-miner restart"
+      if confirm_registered; then
+        ok "Sponsored: FLOP registered your miner at block $REGISTERED_BLOCK and staked about 1 million test FLOP for it"
+      else
+        ok "Sponsorship accepted by FLOP (HTTP $1)"
+        note "Your miner is not on FLOP's explorer yet: check again in a few minutes with sudo flop-miner status."
       fi
+      restart_worker
       ;;
     409)
-      set_flag sponsored
+      # "already sponsored": true only if the miner is registered; otherwise FLOP must reconcile it (FLOP's skill)
       stop_sponsor_timer
-      ok "Already sponsored"
-      ;;
-    429 | 503 | none)
-      if [ "$2" = 1 ] || [ ! -f "$STATE/sponsor-since" ]; then date +%s > "$STATE/sponsor-since"; fi
-      start_sponsor_timer
-      if [ "$1" = none ]; then
-        note "FLOP's devnet sponsor did not answer (network, or FLOP's devnet is busy)."
+      if confirm_registered; then
+        set_flag sponsored
+        ok "Already sponsored: your miner is registered on FLOP's devnet (block $REGISTERED_BLOCK)"
+        restart_worker
       else
-        note "FLOP's devnet sponsor is full right now (HTTP $1): it only takes a few new miners at a time."
+        echo "HTTP 409, not registered" > "$STATE/sponsor-stopped"
+        note "FLOP says this account is already sponsored (HTTP 409), but your miner is not on FLOP's explorer."
+        note "FLOP's sponsor has to reconcile it: the installer stops asking. Report it, with FLOP's answer below,"
+        note "on FLOP's public issue tracker: https://github.com/flop-labs/network/issues"
+        [ -z "$said" ] || note "FLOP says: $said"
       fi
-      [ -z "$said" ] || note "FLOP says: $said"
-      note "Your miner is installed and keeps running. It asks again every hour, for $SPONSOR_DAYS days."
-      note "Your provider bills the machine meanwhile: follow it with sudo flop-miner status."
-      ;;
-    403 | 422)
-      stop_sponsor_timer
-      note "FLOP did not sponsor this miner (HTTP $1): FLOP has not approved its address, or the operator grant"
-      note "is not valid. The installer stops asking. See $REPO#troubleshooting"
-      [ -z "$said" ] || note "FLOP says: $said"
       ;;
     *)
-      note "Unexpected answer from FLOP's sponsor (HTTP $1). Try again later: sudo flop-miner sponsor"
+      if [ "$action" = retry_later ] || [[ $1 =~ ^(429|5[0-9][0-9]|none)$ ]]; then
+        sponsor_wait "$1" "$2" "$said"
+      elif [[ $1 =~ ^4[0-9][0-9]$ ]]; then
+        sponsor_refused "$1" "$action" "$said"
+      else
+        stop_sponsor_timer
+        echo "HTTP $1, unexpected" > "$STATE/sponsor-stopped"
+        note "Unexpected answer from FLOP's sponsor (HTTP $1): the installer stops asking. Try again later:"
+        note "sudo flop-miner sponsor"
+        [ -z "$said" ] || note "FLOP says: $said"
+      fi
       ;;
   esac
 }
 
 sponsorship() { # $1: 1 when the user asked, 0 from the timer
-  local rc=0 since code
+  local rc=0 since code why
   if flag sponsored; then
     stop_sponsor_timer
     [ "$1" = 0 ] || ok "Already sponsored"
@@ -914,6 +1106,12 @@ sponsorship() { # $1: 1 when the user asked, 0 from the timer
     ok "Your miner is already registered on FLOP's devnet"
     return 0
   fi
+  # A registered miner must answer FLOP's calibration jobs: a stopped miner is never registered
+  if [ -f "$STATE/stopped" ]; then
+    echo "sponsorship: not asked (the miner is stopped)" >> "$LOG"
+    [ "$1" = 0 ] || note "The miner is stopped: start it with sudo flop-miner restart, which also asks FLOP's sponsor."
+    return 0
+  fi
   if [ "$1" = 0 ]; then
     since=$(cat "$STATE/sponsor-since" 2> /dev/null || echo 0)
     if [ $(($(date +%s) - since)) -gt $((SPONSOR_DAYS * 86400)) ]; then
@@ -922,12 +1120,20 @@ sponsorship() { # $1: 1 when the user asked, 0 from the timer
       return 0
     fi
   fi
-  code=$(sponsor_once)
-  # 503: FLOP's pack README says to retry within a minute
-  if [ "$code" = 503 ] && [ "$1" = 1 ]; then
-    sleep 60
-    code=$(sponsor_once)
+  why=$(ask_blocker)
+  if [ "$why" = stopped ]; then
+    stop_sponsor_timer
+    [ "$1" = 0 ] || explain_blocker stopped
+    return 0
   fi
+  if [ -n "$why" ]; then
+    echo "sponsorship: not asked ($why)" >> "$LOG"
+    if [ "$1" = 1 ] || [ ! -f "$STATE/sponsor-since" ]; then date +%s > "$STATE/sponsor-since"; fi
+    start_sponsor_timer
+    [ "$1" = 0 ] || explain_blocker "$why"
+    return 0
+  fi
+  code=$(sponsor_once)
   handle_sponsor_code "$code" "$1"
 }
 
@@ -1031,7 +1237,7 @@ summary() {
   if flag sponsored; then
     row "Sponsorship" "done: calibration starts by itself and can take a day"
   elif [ "$timer" = active ]; then
-    row "Sponsorship" "waiting for a free slot: asked again every hour"
+    row "Sponsorship" "waiting: FLOP's sponsor is looked at every hour, and asked once it is open"
   else
     row "Sponsorship" "not done (see above)"
   fi
@@ -1048,12 +1254,19 @@ summary() {
 cmd_status() {
   require_root status
   require_installed
-  local addr host code endpoint json rc=0 containers last timer since gpu
+  local addr host code endpoint json rc=0 containers last timer since gpu when lstatus lreason nb
   addr=$(address)
   host=$(envget SESSION_PUBLIC_HOST)
-  say "${BOLD}FLOP GPU miner${RESET}, $(date -u '+%Y-%m-%d %H:%M UTC') (flop-miner $FLOP_MINER_VERSION)"
+  say "${BOLD}FLOP GPU miner${RESET}, $(now_utc) (flop-miner $FLOP_MINER_VERSION)"
   say ""
   row "Miner address" "$addr"
+  if flag retired; then
+    row "Status" "retired$(sed 's/^/ on /' "$STATE/retired-on" 2> /dev/null || true): its sponsored stake unbonds over 7 days"
+    row "" "and goes back to FLOP's sponsor. Delete the machine at your provider (it bills until deleted)."
+    say ""
+    say "Explorer: $EXPLORER/mining"
+    return 0
+  fi
   code=$(http_code "https://$host/session/info")
   if [ "$code" != 401 ] && [ "$(mode)" = public ] &&
     [ "$(http_code --resolve "$host:443:127.0.0.1" "https://$host/session/info")" = 401 ]; then
@@ -1083,20 +1296,38 @@ cmd_status() {
       row "Calibration" "$(jq -r 'if .calibration then "\(.calibration.phase): \(.calibrationReport.verifiedJobs // "?") jobs verified, \(.calibration.gnMax) GFLOP/s" else "in progress (\(.calibrationReport.verifiedJobs // 0) jobs verified so far; it can take a day)" end' <<< "$json")"
       [ "$(jq -r '.strikes // 0' <<< "$json")" = 0 ] || row "Strikes" "$(jq -r '.strikes' <<< "$json") (calibration jobs missed or failed)"
       ;;
-    1) row "FLOP devnet" "not registered yet" ;;
+    1)
+      if flag sponsored; then
+        row "FLOP devnet" "not on the explorer yet (FLOP accepted the sponsorship$(sed 's/^/ on /' "$STATE/sponsored-on" 2> /dev/null || true))"
+      else
+        row "FLOP devnet" "not registered yet"
+      fi
+      ;;
     *) row "FLOP devnet" "the explorer does not answer right now" ;;
   esac
-  if flag retired; then
-    row "Sponsorship" "retired: delete the machine at your provider"
-  elif flag sponsored; then
+  if flag sponsored; then
     row "Sponsorship" "done"
   else
     last=$(cat "$STATE/sponsor-last" 2> /dev/null) || last=''
     timer=$(systemctl is-active flop-miner-sponsor.timer 2> /dev/null) || timer=''
     since=$(cat "$STATE/sponsor-since" 2> /dev/null || echo 0)
     row "Sponsorship" "not yet${last:+ (last answer: HTTP ${last##* } on ${last% *})}"
-    if [ "$timer" = active ]; then
-      row "" "asked again automatically every hour"
+    if [ -f "$STATE/sponsor-limits" ]; then
+      when='' lstatus='' lreason=''
+      IFS='|' read -r when lstatus lreason < "$STATE/sponsor-limits" || true
+      row "" "FLOP's limits on $when: ${lstatus}${lreason:+ ($lreason)}"
+    fi
+    nb=$(cat "$STATE/sponsor-not-before" 2> /dev/null || echo 0)
+    if [[ $nb =~ ^[0-9]+$ ]] && [ "$(date +%s)" -lt "$nb" ]; then
+      row "" "FLOP asked to wait until $(date -u -d "@$nb" '+%Y-%m-%d %H:%M UTC')"
+    fi
+    if [ -s "$STATE/sponsor-stopped" ]; then
+      row "" "FLOP refused it ($(cat "$STATE/sponsor-stopped" 2> /dev/null || true)): not asked again by itself"
+      row "" "see the guide's troubleshooting; ask once more with: sudo flop-miner sponsor"
+    elif [ -f "$STATE/stopped" ]; then
+      row "" "on hold while the miner is stopped: sudo flop-miner restart asks again"
+    elif [ "$timer" = active ]; then
+      row "" "looked at again every hour; asked once FLOP's sponsor is open"
     elif [ "$since" != 0 ] && [ $(($(date +%s) - since)) -gt $((SPONSOR_DAYS * 86400)) ]; then
       row "" "automatic retry stopped after $SPONSOR_DAYS days: sudo flop-miner sponsor, or delete the machine"
     else
@@ -1141,7 +1372,12 @@ cmd_sponsor() {
   require_installed
   refuse_retired
   log_open sponsor "${ARGS[*]:-}"
-  if [ "${ARGS[0]:-}" = --auto ]; then sponsorship 0; else sponsorship 1; fi
+  if [ "${ARGS[0]:-}" = --auto ]; then
+    sponsorship 0
+  else
+    rm -f "$STATE/sponsor-stopped" # the user asks explicitly, after a refusal too
+    sponsorship 1
+  fi
 }
 
 cmd_backup() {
@@ -1185,6 +1421,7 @@ cmd_retire() {
   printf '%s\n' "$out" | tee -a "$LOG" | sed 's/^/  /'
   if [ "$rc" = 0 ]; then
     set_flag retired
+    now_utc > "$STATE/retired-on"
     rm -f "$STATE/sponsored"
     ok "Done. You can now delete the machine at your provider (it bills until deleted)."
   else
@@ -1246,9 +1483,9 @@ flop-miner $FLOP_MINER_VERSION: a FLOP devnet GPU miner on one machine, in one c
       --yes           answer yes to every question
   sudo flop-miner status      miner, endpoint, devnet and sponsorship at a glance
   sudo flop-miner logs        follow the miner's logs (Ctrl+C to quit)
-  sudo flop-miner restart     check the decode policy, update FLOP's images, restart everything
+  sudo flop-miner restart     check the decode policy, restart everything with the pinned images
   sudo flop-miner stop        stop the miner (it stays installed)
-  sudo flop-miner sponsor     ask FLOP's devnet sponsor again, until the miner is sponsored
+  sudo flop-miner sponsor     ask FLOP's devnet sponsor now, if its limits say it is open
   sudo flop-miner backup      show the secrets to write down
   sudo flop-miner retire      deregister the miner, before you delete the machine
   sudo flop-miner uninstall   remove the miner from this machine (keeps the keys)

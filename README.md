@@ -8,7 +8,7 @@ that registers your miner with FLOP.
 This is an unofficial community guide, not affiliated with FLOP Labs. It does not replace FLOP's software: it
 downloads FLOP's own public miner pack and runs the steps of its README for you.
 
-[Lire en français](README.fr.md) · Last checked: 5 November 2026 · Installer version 0.1.0
+[Lire en français](README.fr.md) · Last checked: 8 November 2026 · Installer version 0.1.1
 
 ## Before you start
 
@@ -18,9 +18,10 @@ downloads FLOP's own public miner pack and runs the steps of its README for you.
 - **Devnet only: no earnings, no airdrop.** The devnet uses test FLOP, which has no value. FLOP's official links page
   says the devnet earns "no rewards and no airdrop weight". Paid sessions are not open, and FLOP's documentation
   promises neither earnings nor a place on a future mainnet.
-- **Limited admission.** FLOP calls its devnet an "invite-only preview". Its sponsor registers some new miners
-  automatically, but only a few at a time (a cap on miners still being measured, and at most 10 new miners per
-  24 hours). When it is full, the installer asks again every hour, for 7 days.
+- **Limited admission.** Since 2 November 2026, FLOP's miner guide says no invitation is needed: FLOP's sponsor
+  registers a new miner automatically while at most 40 of the miners it sponsored are still being measured, and at
+  most 100 new miners per 24 hours, with one sponsorship per account. When it is full, the installer waits and looks
+  again every hour, for 7 days.
 - **You pay for the GPU, even while nothing happens.** Your provider bills the machine for as long as it exists,
   including while you wait for a sponsorship slot, which can take days. Before renting, multiply the hourly price by
   24 × 7. If FLOP refuses your miner (HTTP 403), or it is still not sponsored after 7 days, delete the machine: a
@@ -100,7 +101,7 @@ one is asked (nothing shows while you type, that is normal).
 Copy this line, paste it into the terminal of the machine, and press Enter:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Syphiliis/flop-gpu-miner/v0.1.0/flop-miner && sudo bash flop-miner install
+curl -fsSLO https://raw.githubusercontent.com/Syphiliis/flop-gpu-miner/v0.1.1/flop-miner && sudo bash flop-miner install
 ```
 
 The installer checks the machine, shows what it is about to do, and asks you to confirm: `Continue? [Y/n]`. Press
@@ -112,7 +113,7 @@ If the machine cannot open ports 80 and 443, use this line instead: the miner th
 free Cloudflare tunnel, with nothing to open.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Syphiliis/flop-gpu-miner/v0.1.0/flop-miner && sudo bash flop-miner install --tunnel
+curl -fsSLO https://raw.githubusercontent.com/Syphiliis/flop-gpu-miner/v0.1.1/flop-miner && sudo bash flop-miner install --tunnel
 ```
 
 If you already ran the first command, `sudo bash flop-miner install --tunnel` is enough.
@@ -127,8 +128,9 @@ Your FLOP miner is installed and running.
   Sponsorship        done: calibration starts by itself and can take a day
 ```
 
-If FLOP's sponsor is full, the last line reads `waiting for a free slot: asked again every hour` instead: that is
-normal, see step 5. If it reads `not done (see above)`, read the message above it.
+If FLOP's sponsor is not taking new miners right now, the last line reads `waiting: FLOP's sponsor is looked at every
+hour, and asked once it is open` instead: that is normal, see step 5. If it reads `not done (see above)`, read the
+message above it.
 
 If the installer stops with an error, read the message: it says what to do. Fix that, then run the same command
 again. The installer is safe to run again: it never replaces your miner account. See
@@ -150,9 +152,14 @@ FLOP sponsors each account only once.
 ## 5. Sponsorship, then calibration
 
 **Sponsorship.** At the end of the installation, FLOP's sponsor registers your miner and stakes about 1 million test
-FLOP for it. If the sponsor is full (the installer says `HTTP 429`), your miner keeps running and the installer asks
-again by itself every hour. After 7 days it stops asking: run `sudo flop-miner sponsor` to try again, or delete the
-machine. You have nothing to do meanwhile, but the machine is billed.
+FLOP for it. FLOP's rule is to read its limits page first and to never retry in a loop, so the installer sends the
+request only when FLOP's limits page ([faucet.flop.network/limits](https://faucet.flop.network/limits)) says the
+sponsor is open, and not while the sponsor's latest registrations on the devnet all failed. Otherwise (the sponsor is
+full, unavailable, or failing), your miner keeps running and the installer looks again by itself every hour, then
+asks once FLOP's sponsor is open; when FLOP asks for a pause, it waits that long. After 7 days it stops looking: run
+`sudo flop-miner sponsor` to try again, or delete the machine. You have nothing to do meanwhile, but the machine is
+billed. When FLOP refuses the miner outright, the installer stops asking by itself: only `sudo flop-miner sponsor`
+asks again.
 
 **Calibration.** Once your miner is registered, FLOP's network sends it test jobs to measure it. FLOP says it can
 take a day, and the measure is renewed every week. **Keep the machine running for as long as you mine**: FLOP
@@ -169,7 +176,7 @@ sudo flop-miner status
 | Session endpoint | `up (answers 401, as it should)`: your miner is reachable. 401 means it refuses anonymous visitors, which is right |
 | FLOP devnet | `not registered yet` before sponsorship, then the block where it was registered and its stake |
 | Calibration | `in progress`, then `Active` with the number of jobs verified and the measured capacity |
-| Sponsorship | `done`, or the sponsor's last answer and what happens next |
+| Sponsorship | `done`, or the sponsor's last answer, what FLOP's limits page said, and what happens next |
 
 You can also look for your address among the devnet's miners: [explorer.devnet.flop.network/mining](https://explorer.devnet.flop.network/mining).
 
@@ -179,9 +186,9 @@ You can also look for your address among the devnet's miners: [explorer.devnet.f
 |---|---|
 | `sudo flop-miner status` | the miner at a glance |
 | `sudo flop-miner logs` | the miner's live logs (Ctrl+C to quit) |
-| `sudo flop-miner restart` | checks FLOP's decode policy, takes FLOP's new images, restarts everything; asks the sponsor again if the miner is not sponsored yet |
-| `sudo flop-miner stop` | stops the miner without removing it; calibration jobs then go unanswered. Start it again with `sudo flop-miner restart` |
-| `sudo flop-miner sponsor` | asks FLOP's sponsor again now, until the miner is sponsored |
+| `sudo flop-miner restart` | checks FLOP's decode policy, restarts everything with the installer's pinned images; asks the sponsor again if the miner is not sponsored yet and FLOP's limits say it is open |
+| `sudo flop-miner stop` | stops the miner without removing it; calibration jobs then go unanswered, and FLOP's sponsor is not asked meanwhile. Start it again with `sudo flop-miner restart` |
+| `sudo flop-miner sponsor` | asks FLOP's sponsor now, if its limits say it is open and FLOP asked for no wait |
 | `sudo flop-miner backup` | shows the secrets to write down |
 | `sudo flop-miner retire` | deregisters the miner, before you delete the machine |
 | `sudo flop-miner uninstall` | removes the miner from the machine, keeps the keys |
@@ -212,8 +219,17 @@ miner does not stop the bill.
 | `could not get its HTTPS certificate` | open ports 80 and 443 (TCP) in your provider's firewall and run the same command again; or accept the tunnel the installer offers |
 | `The miner itself does not answer yet` | look at `sudo flop-miner logs`, then run the same command again |
 | `decode-policy check did not pass` | FLOP's devnet may be busy, or FLOP changed the model's policy: wait a few minutes, then run the same command again. If it keeps failing, look for a new version of this installer |
-| `FLOP's devnet sponsor is full right now (HTTP 429)` | nothing to do: it asks again every hour, for 7 days. Your machine is billed meanwhile |
-| `FLOP did not sponsor this miner (HTTP 403)` | FLOP has not approved this miner. FLOP's pages disagree here: its miner guide says FLOP approves each account, its pack README says new miners are approved automatically. On 5 November 2026 FLOP had published no contact for access requests. The installer stops asking: delete the machine to stop the bill, and follow only the accounts listed on [FLOP's official links page](https://docs.flop.network/docs/official-links) (FLOP has no official Discord or Telegram) |
+| `FLOP's devnet sponsor is full right now` | nothing to do: FLOP takes a new miner when one of the miners it sponsored is calibrated, or after its daily limit. The installer looks again every hour, for 7 days. Your machine is billed meanwhile |
+| `unavailable right now (HTTP` | FLOP's sponsor is down for a while. Nothing to do: the installer looks again every hour |
+| `does not say that the sponsor is open`, or `limits page ... does not answer` | FLOP's sponsor cannot take requests right now, and FLOP asks to send one only when its limits page says open. Nothing to do: the installer looks again every hour |
+| `failed its latest registrations on the devnet` | FLOP's sponsor is failing: a request now could use up your miner's only sponsorship. The installer waits and looks again every hour |
+| `FLOP asks to wait until` (or `asked`) | FLOP asked for a pause after its last answer. Nothing to do: the installer waits until then, then asks by itself |
+| `Sponsorship accepted by FLOP`, then `not on FLOP's explorer yet` | wait a few minutes, then `sudo flop-miner status`. If your miner is still not on the explorer an hour later, FLOP's sponsor failed: report it on FLOP's public [issue tracker](https://github.com/flop-labs/network/issues) |
+| `already sponsored (HTTP 409), but your miner is not on FLOP's explorer` | FLOP's sponsor has to reconcile this account. The installer stops asking: report it, with FLOP's answer, on FLOP's public [issue tracker](https://github.com/flop-labs/network/issues) |
+| `FLOP did not sponsor this miner (HTTP` | FLOP has not approved this address, or an operator grant is not valid; or FLOP asks for a person to look at it. The installer stops asking. FLOP's channel for access is a public [access request](https://github.com/flop-labs/network/issues/new?template=access.yml) on its `network` repository. Delete the machine to stop the bill, and follow only the accounts listed on [FLOP's official links page](https://docs.flop.network/docs/official-links) (FLOP has no official Discord or Telegram) |
+| `FLOP refused this miner earlier` | after a refusal, `restart` and the installer do not ask again by themselves. Change what FLOP asked (a new grant with `--grant`, for example), then `sudo flop-miner sponsor` |
+| `Unexpected answer from FLOP's sponsor` | the installer stops asking. Try again later with `sudo flop-miner sponsor`; if it keeps happening, look for a new version of this installer |
+| `The miner is stopped` | `sudo flop-miner restart` starts it and asks FLOP's sponsor: a stopped miner is never registered, since it could not answer FLOP's calibration jobs |
 | `does not have the expected fingerprint` | FLOP published a new miner pack: wait for a new version of this installer. Do not bypass the check |
 | `The files of your miner account are missing` | put `signer` and `miner-key.json` back from your backup (see Advanced), then run the same command again |
 | `The retirement did not go through` | the miner is already stopped: run `sudo flop-miner retire` again later (FLOP refuses it while a session or a dispute is open) |
@@ -237,19 +253,24 @@ flowchart LR
   G["agents and FLOP's gateway<br/>(sessions: not open yet)"] --> T
 ```
 
-The installer follows the README of FLOP's miner pack, with two differences: it asks for sponsorship last, once the
-miner answers, and it does not create the pack's password-protected keystore (`miner.json`), since none of the
-pack's scripts reads it (they sign with the `signer` file).
+The installer follows the README of FLOP's miner pack, with three differences:
+
+- it asks for sponsorship last, once the miner answers, and only when FLOP's limits page says the sponsor is open;
+- it pins FLOP's three images by version and digest, where the pack's example settings name the floating `:stable`
+  tags: FLOP's miner guide says to use version-and-digest references, and "do not use floating stable or latest
+  tags";
+- it does not create the pack's password-protected keystore (`miner.json`), since none of the pack's scripts reads
+  it (they sign with the `signer` file).
 
 | step | what the installer does |
 |---|---|
 | 1. Checking | Ubuntu 22.04 or 24.04, x86-64, a full machine, 50 GB of free disk, an NVIDIA GPU of 16 GB or more, driver 580 or newer, BF16 support; then the public address: your domain, `<ip>.sslip.io`, or a tunnel |
 | 2. Dependencies | installs what is missing: Docker from Docker's repository, the NVIDIA container toolkit from NVIDIA's repository, `jq`, `curl`, `openssl`; opens ports 80 and 443 in `ufw` if it is active |
-| 3. FLOP's pack | downloads `flop-miner-pack-devnet-ts-20261103c` from flop.network and checks its SHA-256 fingerprint against the one FLOP publishes; any other file is refused |
+| 3. FLOP's pack | downloads `flop-miner-pack-devnet-ts-20261106` from flop.network and checks its SHA-256 fingerprint against the one FLOP publishes; any other file is refused |
 | 4. Account | creates your miner account with FLOP's own key tool, in FLOP's image pinned by its digest, with no network |
-| 5. Model and settings | downloads the model with the pack's `fetch-model.sh`; creates the session seed and the private settings (`miner.env`) |
+| 5. Model and settings | downloads the model with the pack's `fetch-model.sh`; creates the session seed and the private settings (`miner.env`), with FLOP's images pinned: CLI 0.1.220, worker 0.1.286, backend 0.1.239 |
 | 6. Start | `decode-policy.sh` (FLOP's chain must accept the model's policy), then Docker Compose starts the backend, the worker and, without a tunnel, Caddy; the installer waits for the HTTPS address to answer 401 |
-| 7. Sponsorship | the pack's `sponsor.sh`, signed on the machine by your miner account; an hourly timer while the sponsor is full |
+| 7. Sponsorship | reads FLOP's limits page and the sponsor's latest registrations, then the pack's `sponsor.sh`, signed on the machine by your miner account, once FLOP says open; an hourly timer until then |
 
 What stays on the machine, readable by root only:
 
@@ -264,9 +285,9 @@ What stays on the machine, readable by root only:
 
 What leaves the machine:
 
-- requests to FLOP's devnet (its RPC, its calibration mailbox, its sponsor), and to FLOP's explorer
-  (explorer.devnet.flop.network), which `status`, the sponsorship (and its hourly retry) and `uninstall` ask about
-  your miner;
+- requests to FLOP's devnet (its RPC, its calibration mailbox, its sponsor and the sponsor's limits page), and to
+  FLOP's explorer (explorer.devnet.flop.network), which `status`, the sponsorship (and its hourly look) and
+  `uninstall` ask about your miner and about the sponsor's latest registrations;
 - the downloads: Ubuntu's, Docker's and NVIDIA's packages, flop.network, FLOP's images on GitHub's registry, Docker
   Hub, the model from Hugging Face and its downloader's packages from PyPI (both through the pack's
   `fetch-model.sh`), and Cloudflare's tunnel client from GitHub with `--tunnel`;
@@ -282,12 +303,12 @@ Nothing else is sent, and nothing goes to the authors of this guide.
 The installer is one readable bash file. To read it before running it:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Syphiliis/flop-gpu-miner/v0.1.0/flop-miner
+curl -fsSLO https://raw.githubusercontent.com/Syphiliis/flop-gpu-miner/v0.1.1/flop-miner
 less flop-miner
 sudo bash flop-miner install
 ```
 
-You run the very file you read, and the address names a version (`v0.1.0`) rather than the latest changes.
+You run the very file you read, and the address names a version (`v0.1.1`) rather than the latest changes.
 
 ## Advanced
 
@@ -316,9 +337,10 @@ machine's Docker volume: the new machine publishes a new one, and a different GP
 
 **Several miners.** One machine per miner: each has its own account, sponsorship and calibration.
 
-**Updates.** `sudo flop-miner restart` takes FLOP's current images. When FLOP publishes a new miner pack, a new
-version of this installer pins it: run the one-line command of the new version. It takes the new pack's settings,
-keeps your account, tokens and address, and keeps the previous settings file aside.
+**Updates.** The installer pins FLOP's images, so `sudo flop-miner restart` restarts with the same ones. When FLOP
+publishes a new miner pack or new images, a new version of this installer pins them: run the one-line command of the
+new version. It takes the new pack's settings and images, keeps your account, tokens and address, and keeps the
+previous settings file aside.
 
 **Uninstall.** `sudo flop-miner uninstall` removes the containers, the timers and the command, and keeps your keys in
 `/opt/flop-miner`. Retire first: after uninstall, the `retire` command is gone. Delete `/opt/flop-miner` only after
@@ -326,22 +348,25 @@ keeps your account, tokens and address, and keeps the previous settings file asi
 
 ## Status of this guide
 
-Version 0.1.0, 5 November 2026. The installer is checked on a test bench that simulates the outside tools
-(`tests/run.sh`: no GPU, no FLOP, 180 checks). The FLOP steps it automates come from FLOP's pack README and the
-pack's scripts, read on 5 November 2026. A complete run of this installer on a real GPU machine up to calibration has
-not been reported yet: if you run it, please share your result in an issue (GPU, provider, what
-`sudo flop-miner status` says).
+Version 0.1.1, 8 November 2026. The installer is checked on a test bench that simulates the outside tools
+(`tests/run.sh`: no GPU, no FLOP, 291 checks). The FLOP steps it automates come from FLOP's pack README and the
+pack's scripts, and its sponsorship rules from FLOP's miner guide and skill, read on 8 November 2026. A complete run
+of this installer on a real GPU machine up to calibration has not been reported yet: if you run it, please share
+your result in an issue (GPU, provider, what `sudo flop-miner status` says).
 
-FLOP's devnet changes quickly. The installer pins the miner pack it was written for, and refuses any other. When
-FLOP changes the pack, this guide needs a new version.
+FLOP's devnet changes quickly. The installer pins the miner pack and the images it was written for, and refuses any
+other pack. When FLOP changes them, this guide needs a new version.
 
 ## Sources
 
-- FLOP, "Run a FLOP miner on a GPU host", last updated 2 November 2026: <https://docs.flop.network/docs/run-miner>
+- FLOP, "Run a FLOP miner on a GPU host", last updated 3 November 2026 (admission, devnet limits, exact image pins,
+  sponsorship rules): <https://docs.flop.network/docs/run-miner>
 - FLOP, "Put your GPU to work on FLOP" (calibration renewed every week): <https://docs.flop.network/docs/run-gpu-provider>
-- FLOP's miner pack and its README: <https://flop.network/releases/cli/miner-pack-devnet-ts-20261103c/README.md>
-- The pack's fingerprint, published by FLOP: <https://flop.network/skills/flop-miner-devnet/SKILL.md>
-- FLOP's image and model manifest: <https://flop.network/releases.json>
+- FLOP's miner pack and its README: <https://flop.network/releases/cli/miner-pack-devnet-ts-20261106/README.md>
+- The pack's fingerprint and FLOP's sponsorship rules, published by FLOP: <https://flop.network/skills/flop-miner-devnet/SKILL.md>
+- FLOP's sponsor limits, live: <https://faucet.flop.network/limits>
+- FLOP's image and model manifest: <https://flop.network/releases.json> (the images themselves are on GitHub's
+  registry, `ghcr.io/flop-labs/flop-core`)
 - FLOP's official links (no token, devnet without rewards or airdrop weight): <https://docs.flop.network/docs/official-links>
 - FLOP's FAQ, testnet and timeline: <https://docs.flop.network/docs/testnet-and-timeline>
 - FLOP's devnet explorer: <https://explorer.devnet.flop.network/mining>

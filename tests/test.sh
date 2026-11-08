@@ -44,8 +44,19 @@ case $1 in
       *" key generate "*) echo x >> "$FAKE_STATE/keygen"; printf '{"secretPhrase":"%s","ss58Address":"%s"}\n' "$FAKE_PHRASE" "$FAKE_ADDR" ;;
       *" key inspect "*) printf '{"ss58Address":"%s"}\n' "$(cat "$FAKE_STATE/inspect-addr" 2> /dev/null || echo "$FAKE_ADDR")" ;;
     esac ;;
+  image) [ "$2" != inspect ] || echo sha256:fakecli ;;
+  ps) [[ $a != *" ancestor=sha256:fakecli "* ]] || echo fakecid ;; # a container left behind by a script past its limit
 esac
 exit 0
+EOF
+
+fake timeout << 'EOF'
+#!/bin/bash
+# like timeout -k 10 LIMIT COMMAND...: code 124 for the script named in $FAKE_STATE/timeout-<script>
+[ "$1" != -k ] || shift 2
+shift
+[ ! -f "$FAKE_STATE/timeout-$(basename "$1")" ] || exit 124
+exec "$@"
 EOF
 
 fake nvidia-smi << 'EOF'
@@ -87,6 +98,22 @@ case $url in
   http://127.0.0.1:8645/session/info) reply "$(code worker-code)" ;;
   *.trycloudflare.com/session/info) reply 401 ;;
   */session/info) if [ -n "$resolve" ]; then reply "$(code local-code)"; else reply "$(code public-code)"; fi ;;
+  https://faucet.flop.network/limits) # $FAKE_STATE/limits: open (default), automatic_full, unknown, or down
+    s=$(cat "$FAKE_STATE/limits" 2> /dev/null || echo open)
+    case $s in
+      down) exit 22 ;;
+      unknown) printf '{"sponsor":{"miner":{"status":"unknown","reason":"sponsor_read_timeout"}}}' ;;
+      *) printf '{"sponsor":{"miner":{"status":"%s"}}}' "$s" ;;
+    esac ;;
+  */api/transactions?section=minerStaking*) # the sponsor's last registrations; all failed with $FAKE_STATE/chain-failing
+    ok=true
+    [ ! -f "$FAKE_STATE/chain-failing" ] || ok=false
+    printf '{"data":['
+    for i in 1 2 3 4 5; do
+      [ "$i" = 1 ] || printf ','
+      printf '{"method":"sponsorRegisterMiner","success":%s,"timestamp":%s}' "$ok" "$((1794120000000 + i))"
+    done
+    printf ',{"method":"deregisterMiner","success":true,"timestamp":1794120000009}]}' ;;
   */api/miners/*)
     if [ -f "$FAKE_STATE/registered" ]; then
       reply 200 '{"registeredBlock":42,"sponsoredStake":"1000000000000000000000000","strikes":0,"calibration":null,"calibrationReport":{"verifiedJobs":3}}'
@@ -188,6 +215,8 @@ make_pack() { # make_pack OUTPUT MODEL_HASH
   cat > "$p/miner.env.example" << EOF2
 FLOP_CLI=ghcr.io/flop-labs/flop-core/cli:stable
 COMPOSE_PROJECT_NAME=flop-miner-01
+FLOP_WORKER_IMAGE=ghcr.io/flop-labs/flop-core/miner-worker:stable
+FLOP_BACKEND_IMAGE=ghcr.io/flop-labs/flop-core/miner-vllm-toploc:stable
 FLOP_RPC=wss://rpc.devnet.flop.network
 MINER_SIGNER_FILE=/opt/flop-miner/signer
 MINER_ENCLAVE_KEY_FILE=/opt/flop-miner/session-keys/enclave.seed
@@ -239,13 +268,27 @@ else
   code=$(cat "$FAKE_STATE/sponsor-code" 2> /dev/null || echo 201)
 fi
 [ "$code" != none ] || { echo "Error: getaddrinfo EAI_AGAIN rpc.devnet.flop.network" >&2; exit 1; }
-echo "$FAKE_ADDR $code {"
+if [ "$code" = 502raw ]; then # a gateway's own page: the real script prints {} and its default action on stderr
+  echo "$FAKE_ADDR 502 {}"
+  echo "sponsor refused: 502 (report_to_operator): no detail. https://faucet.flop.network/limits shows the current limits." >&2
+  exit 1
+fi
+echo "$FAKE_ADDR ${code:0:3} {"
 case $code in
-  429) printf '  "error": "automatic miner sponsorship is full: at most 6 automatically sponsored miners may be uncalibrated at once",\n  "reason": "auto_miner_cap_full",\n  "retryAfterSeconds": 3600\n' ;;
-  201) echo '  "ok": true'; touch "$FAKE_STATE/registered" ;;
+  409reg) printf '  "error": "already sponsored",\n  "reason": "already_sponsored"\n'; touch "$FAKE_STATE/registered" ;;
+  409) printf '  "error": "already sponsored",\n  "reason": "already_sponsored"\n' ;;
+  409op) printf '  "error": "already sponsored",\n  "reason": "already_sponsored",\n  "action": "report_to_operator"\n' ;;
+  422) printf '  "error": "operator review needed",\n  "reason": "operator_review"\n' ;;
+  400fix) printf '  "error": "issuedAt is too old",\n  "reason": "stale_request",\n  "action": "fix_request"\n' ;;
+  503w) printf '  "error": "sponsor busy",\n  "reason": "sponsor_busy",\n  "action": "retry_later",\n  "retryAfterSeconds": 600\n' ;;
+  429) printf '  "error": "automatic miner sponsorship is full: at most 40 automatically sponsored miners may be uncalibrated at once",\n  "reason": "auto_miner_cap_full",\n  "action": "retry_later",\n  "retryAfterSeconds": 3600\n' ;;
+  429op) printf '  "error": "operator quota used up",\n  "reason": "operator_quota",\n  "action": "report_to_operator"\n' ;;
+  503) printf '  "error": "sponsor temporarily unavailable",\n  "reason": "sponsor_unavailable",\n  "action": "retry_later"\n' ;;
+  201) echo '  "ok": true'; [ -f "$FAKE_STATE/no-register" ] || touch "$FAKE_STATE/registered" ;;
 esac
 echo "}"
-[ "$code" = 201 ] || exit 1
+# the 20261106 pack's sponsor-request.mjs adds this line on stderr after a refusal
+[ "$code" = 201 ] || { echo "sponsor refused: see the JSON above. https://faucet.flop.network/limits shows the current limits." >&2; exit 1; }
 EOF2
   cat > "$p/retire.sh" << 'EOF2'
 #!/usr/bin/env bash
@@ -317,8 +360,16 @@ check "public name from the IP" grep -qxF SESSION_PUBLIC_HOST=203-0-113-10.sslip
 check "inference key drawn" grep -qE '^INFERENCE_API_KEY=[0-9a-f]{64}$' /opt/flop-miner/miner.env
 check "session token drawn" grep -qE '^SESSION_AUTH_TOKEN=[0-9a-f]{64}$' /opt/flop-miner/miner.env
 check "decode policy written by the pack" grep -qxF DECODE_POLICY_HASH=0xfeed /opt/flop-miner/miner.env
-check "CLI image pulled before the time limit" called "docker pull -q ghcr.io/flop-labs/flop-core/cli:stable"
-check "decode-policy gets the settings' CLI and RPC" called "decode-policy FLOP_CLI=ghcr.io/flop-labs/flop-core/cli:stable FLOP_RPC=wss://rpc.devnet.flop.network"
+CLI_PIN='ghcr\.io/flop-labs/flop-core/cli:v0\.1\.220@sha256:[0-9a-f]{64}'
+check "CLI image pulled, pinned, before the time limit" grep -qE "^docker pull -q $CLI_PIN\$" "$W/calls"
+check "decode-policy gets the settings' CLI and RPC" grep -qE "^decode-policy FLOP_CLI=$CLI_PIN FLOP_RPC=wss://rpc\.devnet\.flop\.network\$" "$W/calls"
+check "CLI pinned by version and digest" grep -qE "^FLOP_CLI=$CLI_PIN\$" /opt/flop-miner/miner.env
+check "worker pinned by version and digest" grep -qE '^FLOP_WORKER_IMAGE=ghcr\.io/flop-labs/flop-core/miner-worker:v0\.1\.286@sha256:[0-9a-f]{64}$' /opt/flop-miner/miner.env
+check "backend pinned by version and digest" grep -qE '^FLOP_BACKEND_IMAGE=ghcr\.io/flop-labs/flop-core/miner-vllm-toploc:v0\.1\.239@sha256:[0-9a-f]{64}$' /opt/flop-miner/miner.env
+check "no floating tag left" bash -c "! grep -q ':stable' /opt/flop-miner/miner.env"
+check "FLOP's limits read before the request" called "curl https://faucet.flop.network/limits"
+check "the sponsor's last registrations read" called "curl https://explorer.devnet.flop.network/api/transactions?section=minerStaking"
+check "says the block of the registration" has "Sponsored: FLOP registered your miner at block 42"
 check "account created once" count "$F/keygen" 1
 check "keygen pinned by digest, offline" called "docker run --rm --network none --log-driver none --user 0:0 --entrypoint zkv-relay ghcr.io/flop-labs/flop-core/node-devnet:sha-eea56e7@sha256:61f1eebdc5ba2e58"
 check "model fetched" called "fetch-model Qwen/Qwen2.5-0.5B-Instruct 7ae557604adf67be50417f59c2c2f167def9a775 /opt/flop-miner/models/qwen2.5-0.5b-instruct"
@@ -338,8 +389,11 @@ KEY=$(grep '^INFERENCE_API_KEY=' /opt/flop-miner/miner.env)
 
 CASE="run again"
 : > "$W/calls"
+# as 0.1.0 left it: the pack's floating tag
+sed -i 's|^FLOP_WORKER_IMAGE=.*|FLOP_WORKER_IMAGE=ghcr.io/flop-labs/flop-core/miner-worker:stable|' /opt/flop-miner/miner.env
 fm install --yes
 check "exit 0" [ "$RC" = 0 ]
+check "a floating tag pinned again" grep -qE '^FLOP_WORKER_IMAGE=ghcr\.io/flop-labs/flop-core/miner-worker:v0\.1\.286@sha256:[0-9a-f]{64}$' /opt/flop-miner/miner.env
 check "account kept" count "$F/keygen" 1
 check "same address" grep -qxF "$FAKE_ADDR" /opt/flop-miner/address
 check "same session seed" [ "$(cat /opt/flop-miner/session-keys/enclave.seed)" = "$SEED" ]
@@ -392,6 +446,7 @@ check "token kept" grep -qxF INFERENCE_API_KEY=my-own-credential /opt/flop-miner
 check "public name kept" grep -qxF SESSION_PUBLIC_HOST=203-0-113-10.sslip.io /opt/flop-miner/miner.env
 check "policy taken again" grep -qxF DECODE_POLICY_HASH=0xfeed /opt/flop-miner/miner.env
 check "previous settings kept aside" bash -c "ls /opt/flop-miner/.flop-miner/miner.env.before-*"
+check "images pinned over the new pack's tags" bash -c "! grep -q ':stable' /opt/flop-miner/miner.env"
 
 CASE="retire"
 FM=/usr/local/bin/flop-miner fm retire --yes
@@ -402,6 +457,10 @@ check "says delete the machine" has "You can now delete the machine"
 check "miner stopped" [ ! -f "$F/up" ]
 check "tunnel and its timer stopped" called "systemctl disable --now flop-miner-sync.timer flop-miner-tunnel.service"
 check "sponsored flag cleared" [ ! -e /opt/flop-miner/.flop-miner/sponsored ]
+FM=/usr/local/bin/flop-miner fm status
+check "status: retired" has "retired on "
+check "status: no restart offered" hasnt "sudo flop-miner restart"
+check "status: no unexpected error" hasnt "Unexpected error"
 
 CASE="install after retire"
 fm install --yes
@@ -417,22 +476,108 @@ check "shows FLOP's own words" has "FLOP says: automatic miner sponsorship is fu
 check "retry timer on" [ -f "$F/sponsor-timer" ]
 check "timer unit written" grep -qF "ExecStart=/usr/local/bin/flop-miner sponsor --auto" /etc/systemd/system/flop-miner-sponsor.service
 check "miner still started" [ -f "$F/up" ]
-check "summary says waiting" has "waiting for a free slot"
+check "summary says waiting" has "waiting: FLOP's sponsor is looked at every hour"
+check "FLOP's wait kept" [ -s /opt/flop-miner/.flop-miner/sponsor-not-before ]
+check "says until when" has "FLOP asks to wait until"
 FM=/usr/local/bin/flop-miner fm status
-check "status: retry on" has "asked again automatically every hour"
+check "status: retry on" has "looked at again every hour"
+check "status: FLOP's wait" has "FLOP asked to wait until"
 echo 201 > "$F/sponsor-code"
 FM=/usr/local/bin/flop-miner fm sponsor --auto
+check "timer run within FLOP's wait: nothing sent" count "$F/sponsor-calls" 1
+FM=/usr/local/bin/flop-miner fm sponsor
+check "asked by hand within FLOP's wait: nothing sent" count "$F/sponsor-calls" 1
+check "asked by hand within FLOP's wait: says so" has "FLOP asked to wait until"
+echo 0 > /opt/flop-miner/.flop-miner/sponsor-not-before # an hour later
+FM=/usr/local/bin/flop-miner fm sponsor --auto
 check "timer run: exit 0" [ "$RC" = 0 ]
+check "timer run: asked once more" count "$F/sponsor-calls" 2
 check "timer run: sponsored" grep -qxF "$FAKE_ADDR" /opt/flop-miner/.flop-miner/sponsored
 check "timer run: timer off" [ ! -f "$F/sponsor-timer" ]
 
-fresh "sponsor busy (503), then accepted a minute later"
+fresh "sponsor unavailable (503), then accepted"
 printf '503\n201\n' > "$F/sponsor-seq"
 fm install --yes
 check "exit 0" [ "$RC" = 0 ]
-check "waited a minute" called "sleep 60"
-check "asked twice" count "$F/sponsor-calls" 2
+check "asked once, no retry in a loop" count "$F/sponsor-calls" 1
+check "no quick retry" bash -c "! grep -q '^sleep 60' '$W/calls'"
+check "says unavailable, not full" has "unavailable right now (HTTP 503)"
+check "shows FLOP's reason" has "FLOP says: sponsor temporarily unavailable (sponsor_unavailable)"
+check "retry timer on" [ -f "$F/sponsor-timer" ]
+FM=/usr/local/bin/flop-miner fm sponsor --auto
+check "timer run: sponsored" [ -s /opt/flop-miner/.flop-miner/sponsored ]
+check "timer run: asked twice in all" count "$F/sponsor-calls" 2
+
+fresh "FLOP's limits say full (automatic_full)"
+echo automatic_full > "$F/limits"
+fm install --yes
+check "exit 0" [ "$RC" = 0 ]
+check "nothing sent" [ ! -e "$F/sponsor-calls" ]
+check "says full, from the limits" has "full right now (its limits page says automatic_full)"
+check "retry timer on" [ -f "$F/sponsor-timer" ]
+check "miner still started" [ -f "$F/up" ]
+check "no unexpected error" hasnt "Unexpected error"
+FM=/usr/local/bin/flop-miner fm status
+check "status: FLOP's limits shown" has "FLOP's limits on "
+check "status: their status" has ": automatic_full"
+FM=/usr/local/bin/flop-miner fm sponsor --auto
+check "timer run while full: nothing sent" [ ! -e "$F/sponsor-calls" ]
+echo open > "$F/limits"
+FM=/usr/local/bin/flop-miner fm sponsor --auto
+check "timer run once open: sent once" count "$F/sponsor-calls" 1
+check "timer run once open: sponsored" [ -s /opt/flop-miner/.flop-miner/sponsored ]
+
+fresh "FLOP's limits cannot read the sponsor (unknown)"
+echo unknown > "$F/limits"
+fm install --yes
+check "exit 0" [ "$RC" = 0 ]
+check "nothing sent" [ ! -e "$F/sponsor-calls" ]
+check "says it is not open" has "does not say that the sponsor is open (it says unknown, sponsor_read_timeout)"
+check "retry timer on" [ -f "$F/sponsor-timer" ]
+FM=/usr/local/bin/flop-miner fm status
+check "status: limits and reason" has "unknown (sponsor_read_timeout)"
+
+fresh "FLOP's limits page down"
+echo down > "$F/limits"
+fm install --yes
+check "exit 0" [ "$RC" = 0 ]
+check "nothing sent" [ ! -e "$F/sponsor-calls" ]
+check "says it does not answer" has "does not answer right now"
+
+fresh "operator grant while the automatic cap is full"
+echo automatic_full > "$F/limits"
+jq -n --arg a "$FAKE_ADDR" '{role: "miner", account: $a, operator: "5Op", expiresAt: 1, signature: "0x00"}' > "$W/grant.json"
+fm install --yes --grant "$W/grant.json"
+check "exit 0" [ "$RC" = 0 ]
+check "sent with the grant" grep -qxF GRANT_FILE=/opt/flop-miner/grant.json "$F/sponsor-env"
 check "sponsored" [ -s /opt/flop-miner/.flop-miner/sponsored ]
+
+fresh "sponsor failing on the chain"
+touch "$F/chain-failing"
+fm install --yes
+check "exit 0" [ "$RC" = 0 ]
+check "nothing sent" [ ! -e "$F/sponsor-calls" ]
+check "says why" has "failed its latest registrations on the devnet"
+check "retry timer on" [ -f "$F/sponsor-timer" ]
+
+fresh "accepted, not on the explorer yet"
+touch "$F/no-register"
+fm install --yes
+check "exit 0" [ "$RC" = 0 ]
+check "says accepted, not registered" has "Sponsorship accepted by FLOP (HTTP 201)"
+check "says to check later" has "not on FLOP's explorer yet"
+check "sponsored flag set" [ -s /opt/flop-miner/.flop-miner/sponsored ]
+check "explorer looked at for two minutes" [ "$(grep -c '^sleep 10' "$W/calls")" = 12 ]
+FM=/usr/local/bin/flop-miner fm status
+check "status: accepted, not on the explorer" has "not on the explorer yet (FLOP accepted the sponsorship on "
+
+fresh "refusal for a person (report_to_operator)"
+echo 429op > "$F/sponsor-code"
+fm install --yes
+check "exit 0" [ "$RC" = 0 ]
+check "stops asking" has "FLOP did not sponsor this miner (HTTP 429, report_to_operator)"
+check "shows FLOP's words" has "FLOP says: operator quota used up (operator_quota)"
+check "no retry timer" [ ! -f "$F/sponsor-timer" ]
 
 fresh "sponsor unreachable"
 echo none > "$F/sponsor-code"
@@ -442,17 +587,145 @@ check "says no answer" has "did not answer"
 check "shows the error" has "FLOP says: Error: getaddrinfo EAI_AGAIN"
 check "retry timer on" [ -f "$F/sponsor-timer" ]
 
-fresh "sponsorship refused (403), then restart"
+fresh "sponsorship refused (403), then restart, then sponsor"
 echo 403 > "$F/sponsor-code"
 fm install --yes
 check "exit 0" [ "$RC" = 0 ]
 check "says not approved" has "FLOP did not sponsor this miner (HTTP 403)"
 check "no retry timer" [ ! -f "$F/sponsor-timer" ]
 FM=/usr/local/bin/flop-miner fm status
-check "status: how to ask again" has "ask again with: sudo flop-miner sponsor"
+check "status: refused, how to ask again" has "ask once more with: sudo flop-miner sponsor"
 echo 201 > "$F/sponsor-code"
 FM=/usr/local/bin/flop-miner fm restart
-check "restart asks the sponsor" grep -qxF "$FAKE_ADDR" /opt/flop-miner/.flop-miner/sponsored
+check "restart does not ask again after a refusal" count "$F/sponsor-calls" 1
+check "restart says why" has "FLOP refused this miner earlier (HTTP 403)"
+FM=/usr/local/bin/flop-miner fm sponsor
+check "sponsor asks again on request" count "$F/sponsor-calls" 2
+check "then sponsored" grep -qxF "$FAKE_ADDR" /opt/flop-miner/.flop-miner/sponsored
+
+fresh "already sponsored (409), on the explorer"
+echo 409reg > "$F/sponsor-code"
+fm install --yes
+check "exit 0" [ "$RC" = 0 ]
+check "says already sponsored, with the block" has "Already sponsored: your miner is registered on FLOP's devnet (block 42)"
+check "sponsored flag set" [ -s /opt/flop-miner/.flop-miner/sponsored ]
+
+fresh "already sponsored (409), not on the explorer"
+echo 409 > "$F/sponsor-code"
+fm install --yes
+check "exit 0" [ "$RC" = 0 ]
+check "says FLOP must reconcile it" has "already sponsored (HTTP 409), but your miner is not on FLOP's explorer"
+check "not marked sponsored" [ ! -e /opt/flop-miner/.flop-miner/sponsored ]
+check "summary not done" hasnt "done: calibration starts by itself"
+check "no retry timer" [ ! -f "$F/sponsor-timer" ]
+FM=/usr/local/bin/flop-miner fm restart
+check "restart does not ask again" count "$F/sponsor-calls" 1
+
+fresh "409 that FLOP sends to a person (report_to_operator)"
+echo 409op > "$F/sponsor-code"
+fm install --yes
+check "FLOP's action first" has "FLOP did not sponsor this miner (HTTP 409, report_to_operator)"
+check "not marked sponsored" [ ! -e /opt/flop-miner/.flop-miner/sponsored ]
+
+fresh "operator review (422)"
+echo 422 > "$F/sponsor-code"
+fm install --yes
+check "exit 0" [ "$RC" = 0 ]
+check "stops asking" has "FLOP did not sponsor this miner (HTTP 422)"
+check "no retry timer" [ ! -f "$F/sponsor-timer" ]
+
+fresh "request to change (fix_request), then restart"
+echo 400fix > "$F/sponsor-code"
+fm install --yes
+check "stops asking" has "FLOP did not sponsor this miner (HTTP 400, fix_request)"
+check "shows FLOP's words" has "FLOP says: issuedAt is too old (stale_request)"
+FM=/usr/local/bin/flop-miner fm restart
+check "restart sends nothing more" count "$F/sponsor-calls" 1
+
+fresh "a gateway's 502 without FLOP's answer, from the timer"
+echo 429 > "$F/sponsor-code"
+fm install --yes
+echo 0 > /opt/flop-miner/.flop-miner/sponsor-not-before
+echo 502raw > "$F/sponsor-code"
+FM=/usr/local/bin/flop-miner fm sponsor --auto
+check "timer run: exit 0" [ "$RC" = 0 ]
+check "asked twice in all" count "$F/sponsor-calls" 2
+check "the timer stays on" [ -f "$F/sponsor-timer" ]
+check "no stop recorded" [ ! -e /opt/flop-miner/.flop-miner/sponsor-stopped ]
+FM=/usr/local/bin/flop-miner fm status
+check "status: last answer 502" has "last answer: HTTP 502"
+
+fresh "503 with FLOP's wait"
+echo 503w > "$F/sponsor-code"
+fm install --yes
+check "exit 0" [ "$RC" = 0 ]
+check "says unavailable" has "unavailable right now (HTTP 503)"
+check "FLOP's wait kept" [ -s /opt/flop-miner/.flop-miner/sponsor-not-before ]
+check "says until when" has "FLOP asks to wait until"
+
+fresh "daily limit reached"
+echo daily_limit_reached > "$F/limits"
+fm install --yes
+check "exit 0" [ "$RC" = 0 ]
+check "nothing sent" [ ! -e "$F/sponsor-calls" ]
+check "says full, from the limits" has "full right now (its limits page says daily_limit_reached)"
+
+fresh "daily limit reached, with an operator grant"
+echo daily_limit_reached > "$F/limits"
+jq -n --arg a "$FAKE_ADDR" '{role: "miner", account: $a, operator: "5Op", expiresAt: 1, signature: "0x00"}' > "$W/grant.json"
+fm install --yes --grant "$W/grant.json"
+check "sent with the grant" count "$F/sponsor-calls" 1
+
+fresh "a stopped miner is not registered"
+echo 429 > "$F/sponsor-code"
+fm install --yes
+echo 0 > /opt/flop-miner/.flop-miner/sponsor-not-before
+FM=/usr/local/bin/flop-miner fm stop --yes
+echo 201 > "$F/sponsor-code"
+FM=/usr/local/bin/flop-miner fm sponsor --auto
+check "timer run while stopped: nothing sent" count "$F/sponsor-calls" 1
+check "not sponsored" [ ! -e /opt/flop-miner/.flop-miner/sponsored ]
+FM=/usr/local/bin/flop-miner fm status
+check "status: on hold" has "on hold while the miner is stopped"
+FM=/usr/local/bin/flop-miner fm sponsor
+check "sponsor by hand while stopped: says so" has "The miner is stopped: start it with sudo flop-miner restart"
+check "sponsor by hand while stopped: nothing sent" count "$F/sponsor-calls" 1
+FM=/usr/local/bin/flop-miner fm restart
+check "restart asks" count "$F/sponsor-calls" 2
+check "then sponsored" [ -s /opt/flop-miner/.flop-miner/sponsored ]
+
+fresh "7 days without a free slot"
+echo automatic_full > "$F/limits"
+fm install --yes
+echo 1 > /opt/flop-miner/.flop-miner/sponsor-since
+echo open > "$F/limits"
+FM=/usr/local/bin/flop-miner fm sponsor --auto
+check "timer run after 7 days: nothing sent" [ ! -e "$F/sponsor-calls" ]
+check "timer off" [ ! -f "$F/sponsor-timer" ]
+check "logged" grep -qF "automatic sponsorship retry stopped after 7 days" /var/log/flop-miner.log
+
+fresh "another account restored"
+fm install --yes
+OTHER=5HxRestoredAccountFromBackupXyz11111111111111111 # base58: no 0, O, I or l
+echo "$OTHER" > "$F/inspect-addr"
+jq --arg a "$OTHER" '.ss58Address = $a' /opt/flop-miner/miner-key.json > "$W/k.json" && cat "$W/k.json" > /opt/flop-miner/miner-key.json
+echo "HTTP 403" > /opt/flop-miner/.flop-miner/sponsor-stopped
+rm -f "$F/registered"
+fm install --yes
+rm -f "$F/inspect-addr"
+check "exit 0" [ "$RC" = 0 ]
+check "says the account changed" has "The miner account changed"
+check "the other account's refusal forgotten" [ ! -e /opt/flop-miner/.flop-miner/sponsor-stopped ]
+check "asked for the new account" count "$F/sponsor-calls" 2
+check "flag for the new account" grep -qxF "$OTHER" /opt/flop-miner/.flop-miner/sponsored
+
+fresh "decode-policy check past its time limit"
+touch "$F/timeout-decode-policy.sh"
+fm install --yes
+check "exit 1" [ "$RC" = 1 ]
+check "explains" has "decode-policy check did not pass (code 124)"
+check "the container left behind found by image ID" called "docker ps -aq --filter ancestor=sha256:fakecli --filter volume=/app/decode-policy.mjs"
+check "and removed" called "docker rm -f fakecid"
 
 fresh "operator grant"
 jq -n --arg a "$FAKE_ADDR" '{role: "miner", account: $a, operator: "5Op", expiresAt: 1, signature: "0x00"}' > "$W/grant.json"

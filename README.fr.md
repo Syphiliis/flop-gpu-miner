@@ -8,7 +8,7 @@ le modèle d'IA, une adresse HTTPS, et la demande qui inscrit votre mineur chez 
 Ce guide communautaire n'est pas officiel et n'a aucun lien avec FLOP Labs. Il ne remplace pas le logiciel de FLOP :
 il télécharge le paquet public de FLOP et en exécute pour vous les étapes, telles que son README les décrit.
 
-[Read in English](README.md) · Vérifié le 5 novembre 2026 · Installateur en version 0.1.0
+[Read in English](README.md) · Vérifié le 8 novembre 2026 · Installateur en version 0.1.1
 
 ## Avant de commencer
 
@@ -19,10 +19,10 @@ il télécharge le paquet public de FLOP et en exécute pour vous les étapes, t
   page des liens officiels de FLOP précise qu'il ne rapporte ni récompense ni poids pour un airdrop (« no rewards and
   no airdrop weight »). Les sessions payées ne sont pas ouvertes, et la documentation de FLOP ne promet ni gain ni
   place sur un futur mainnet.
-- **Admission limitée.** FLOP présente son devnet comme une « invite-only preview » (accès sur invitation). Son
-  parrain inscrit automatiquement une partie des nouveaux mineurs, mais seulement quelques-uns à la fois (un
-  plafond de mineurs encore en cours d'étalonnage, et au plus 10 nouveaux mineurs par 24 heures). Quand c'est plein,
-  l'installateur redemande toutes les heures, pendant 7 jours.
+- **Admission limitée.** Depuis le 2 novembre 2026, le guide du mineur de FLOP dit qu'aucune invitation n'est
+  nécessaire. Le parrain de FLOP inscrit automatiquement un nouveau mineur tant qu'au plus 40 des mineurs qu'il a
+  parrainés sont encore en cours d'étalonnage, dans la limite de 100 nouveaux mineurs par 24 heures, et une seule
+  fois par compte. Quand c'est plein, l'installateur attend et regarde de nouveau toutes les heures, pendant 7 jours.
 - **Le GPU est à vos frais, même quand rien ne se passe.** Votre fournisseur facture la machine tant qu'elle existe,
   y compris pendant l'attente d'une place de parrainage, qui peut durer des jours. Avant de louer, multipliez le prix
   horaire par 24 × 7. Si FLOP refuse votre mineur (HTTP 403), ou s'il n'est toujours pas parrainé au bout de 7 jours,
@@ -104,7 +104,7 @@ tapez le mot de passe s'il est demandé (rien ne s'affiche pendant la frappe, c'
 Copiez cette ligne, collez-la dans le terminal de la machine, puis appuyez sur Entrée :
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Syphiliis/flop-gpu-miner/v0.1.0/flop-miner && sudo bash flop-miner install
+curl -fsSLO https://raw.githubusercontent.com/Syphiliis/flop-gpu-miner/v0.1.1/flop-miner && sudo bash flop-miner install
 ```
 
 L'installateur vérifie la machine, montre ce qu'il va faire, et vous demande de confirmer : `Continue? [Y/n]`.
@@ -117,7 +117,7 @@ Si la machine ne peut pas ouvrir les ports 80 et 443, prenez plutôt cette ligne
 adresse HTTPS par un tunnel Cloudflare gratuit, sans rien ouvrir.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Syphiliis/flop-gpu-miner/v0.1.0/flop-miner && sudo bash flop-miner install --tunnel
+curl -fsSLO https://raw.githubusercontent.com/Syphiliis/flop-gpu-miner/v0.1.1/flop-miner && sudo bash flop-miner install --tunnel
 ```
 
 Si vous avez déjà lancé la première commande, `sudo bash flop-miner install --tunnel` suffit.
@@ -132,8 +132,9 @@ Your FLOP miner is installed and running.
   Sponsorship        done: calibration starts by itself and can take a day
 ```
 
-Si le parrain de FLOP est plein, la dernière ligne indique plutôt `waiting for a free slot: asked again every hour` :
-c'est normal, voir l'étape 5. Si elle indique `not done (see above)`, lisez le message au-dessus.
+Si le parrain de FLOP ne prend pas de nouveaux mineurs pour le moment, la dernière ligne indique plutôt
+`waiting: FLOP's sponsor is looked at every hour, and asked once it is open` : c'est normal, voir l'étape 5. Si elle
+indique `not done (see above)`, lisez le message au-dessus.
 
 Si l'installateur s'arrête sur une erreur, lisez le message : il dit quoi faire. Corrigez, puis relancez la même
 commande. L'installateur se relance sans danger : il ne remplace jamais votre compte de mineur. Voir
@@ -156,10 +157,15 @@ disparaît aussi, et FLOP ne parraine chaque compte qu'une seule fois.
 ## 5. Parrainage, puis étalonnage
 
 **Parrainage.** À la fin de l'installation, le parrain de FLOP inscrit votre mineur et met en jeu pour lui environ
-1 million de FLOP de test (sa mise). Si le parrain est plein (l'installateur affiche `HTTP 429`), votre mineur
-continue de tourner et l'installateur redemande tout seul toutes les heures. Au bout de 7 jours, il cesse de
-redemander : lancez `sudo flop-miner sponsor` pour réessayer, ou supprimez la machine. Vous n'avez rien à faire
-entre-temps, mais la machine est facturée.
+1 million de FLOP de test (sa mise). La règle de FLOP est de lire d'abord sa page de limites et de ne jamais
+redemander en boucle. L'installateur n'envoie donc la demande que si la page de limites de FLOP
+([faucet.flop.network/limits](https://faucet.flop.network/limits)) dit le parrain ouvert, et jamais tant que les
+dernières inscriptions du parrain sur le devnet ont toutes échoué. Sinon (parrain plein, indisponible ou en échec),
+votre mineur continue de tourner : l'installateur regarde de nouveau tout seul toutes les heures, puis demande dès que
+le parrain est ouvert. Quand FLOP demande une pause, il attend ce temps-là. Au bout de 7 jours, il cesse de regarder :
+lancez `sudo flop-miner sponsor` pour réessayer, ou supprimez la machine. Vous n'avez rien à faire entre-temps, mais
+la machine est facturée. Quand FLOP refuse franchement le mineur, l'installateur cesse de demander de lui-même : seul
+`sudo flop-miner sponsor` redemande.
 
 **Étalonnage.** Une fois votre mineur inscrit, le réseau de FLOP lui envoie des travaux de test pour le mesurer.
 Selon FLOP, cela peut prendre une journée, et la mesure est renouvelée chaque semaine. **Laissez la machine allumée
@@ -176,7 +182,7 @@ sudo flop-miner status
 | Session endpoint | `up (answers 401, as it should)` : votre mineur est joignable. 401 veut dire qu'il refuse les visiteurs anonymes, c'est voulu |
 | FLOP devnet | `not registered yet` avant le parrainage, puis le bloc de son inscription et sa mise |
 | Calibration | `in progress`, puis `Active` avec le nombre de travaux vérifiés et la capacité mesurée |
-| Sponsorship | `done`, ou la dernière réponse du parrain et la suite |
+| Sponsorship | `done`, ou la dernière réponse du parrain, ce que disait la page de limites de FLOP, et la suite |
 
 Vous pouvez aussi chercher votre adresse parmi les mineurs du devnet : [explorer.devnet.flop.network/mining](https://explorer.devnet.flop.network/mining).
 
@@ -186,9 +192,9 @@ Vous pouvez aussi chercher votre adresse parmi les mineurs du devnet : [explorer
 |---|---|
 | `sudo flop-miner status` | le mineur en un coup d'œil |
 | `sudo flop-miner logs` | les journaux du mineur en direct (Ctrl+C pour quitter) |
-| `sudo flop-miner restart` | vérifie la politique de décodage de FLOP, prend ses nouvelles images, redémarre tout ; redemande le parrainage si le mineur n'est pas encore parrainé |
-| `sudo flop-miner stop` | arrête le mineur sans le désinstaller ; les travaux d'étalonnage restent alors sans réponse. Pour le relancer : `sudo flop-miner restart` |
-| `sudo flop-miner sponsor` | redemande le parrainage tout de suite, tant que le mineur n'est pas parrainé |
+| `sudo flop-miner restart` | vérifie la politique de décodage de FLOP, redémarre tout avec les images épinglées par l'installateur ; redemande le parrainage si le mineur n'est pas encore parrainé et que la page de limites de FLOP le dit ouvert |
+| `sudo flop-miner stop` | arrête le mineur sans le désinstaller ; les travaux d'étalonnage restent alors sans réponse, et le parrain de FLOP n'est pas sollicité entre-temps. Pour le relancer : `sudo flop-miner restart` |
+| `sudo flop-miner sponsor` | demande le parrainage tout de suite, si la page de limites de FLOP dit le parrain ouvert et que FLOP n'a pas demandé d'attendre |
 | `sudo flop-miner backup` | affiche les secrets à noter |
 | `sudo flop-miner retire` | désinscrit le mineur, avant de supprimer la machine |
 | `sudo flop-miner uninstall` | enlève le mineur de la machine, garde les clés |
@@ -219,8 +225,17 @@ n'arrête pas la facture.
 | `could not get its HTTPS certificate` | ouvrez les ports 80 et 443 (TCP) dans le pare-feu du fournisseur et relancez la même commande ; ou acceptez le tunnel que l'installateur propose |
 | `The miner itself does not answer yet` | regardez `sudo flop-miner logs`, puis relancez la même commande |
 | `decode-policy check did not pass` | le devnet de FLOP est peut-être chargé, ou FLOP a changé la politique du modèle : attendez quelques minutes, puis relancez la même commande. Si l'échec persiste, cherchez une nouvelle version de cet installateur |
-| `FLOP's devnet sponsor is full right now (HTTP 429)` | rien à faire : il redemande toutes les heures, pendant 7 jours. La machine est facturée pendant ce temps |
-| `FLOP did not sponsor this miner (HTTP 403)` | FLOP n'a pas approuvé ce mineur. Les pages de FLOP se contredisent : son guide du mineur dit que FLOP approuve chaque compte, le README de son paquet que les nouveaux mineurs sont approuvés automatiquement. Au 5 novembre 2026, FLOP n'avait publié aucun contact pour les demandes d'accès. L'installateur cesse de redemander : supprimez la machine pour arrêter la facture, et ne suivez que les comptes listés sur [la page des liens officiels de FLOP](https://docs.flop.network/docs/official-links) (FLOP n'a ni Discord ni Telegram officiel) |
+| `FLOP's devnet sponsor is full right now` | rien à faire : FLOP prend un nouveau mineur quand l'un de ceux qu'il a parrainés est étalonné, ou après sa limite du jour. L'installateur regarde de nouveau toutes les heures, pendant 7 jours. La machine est facturée pendant ce temps |
+| `unavailable right now (HTTP` | le parrain de FLOP est indisponible pour un temps. Rien à faire : l'installateur regarde de nouveau toutes les heures |
+| `does not say that the sponsor is open`, ou `limits page ... does not answer` | le parrain de FLOP ne peut pas prendre de demande pour le moment, et FLOP demande de n'en envoyer que lorsque sa page de limites le dit ouvert. Rien à faire : l'installateur regarde de nouveau toutes les heures |
+| `failed its latest registrations on the devnet` | le parrain de FLOP est en échec : une demande maintenant pourrait user l'unique parrainage de votre mineur. L'installateur attend et regarde de nouveau toutes les heures |
+| `FLOP asks to wait until` (ou `asked`) | FLOP a demandé une pause après sa dernière réponse. Rien à faire : l'installateur attend jusque-là, puis demande de lui-même |
+| `Sponsorship accepted by FLOP`, puis `not on FLOP's explorer yet` | attendez quelques minutes, puis `sudo flop-miner status`. Si votre mineur n'est toujours pas sur l'explorateur une heure plus tard, le parrain de FLOP a échoué : signalez-le sur le [suivi public des problèmes](https://github.com/flop-labs/network/issues) de FLOP |
+| `already sponsored (HTTP 409), but your miner is not on FLOP's explorer` | le parrain de FLOP doit remettre ce compte d'aplomb. L'installateur cesse de demander : signalez-le, avec la réponse de FLOP, sur le [suivi public des problèmes](https://github.com/flop-labs/network/issues) de FLOP |
+| `FLOP did not sponsor this miner (HTTP` | FLOP n'a pas approuvé cette adresse, ou un octroi d'opérateur n'est pas valide ; ou FLOP demande qu'une personne regarde. L'installateur cesse de demander. Le canal d'accès de FLOP est une [demande d'accès](https://github.com/flop-labs/network/issues/new?template=access.yml) publique sur son dépôt `network`. Supprimez la machine pour arrêter la facture, et ne suivez que les comptes listés sur [la page des liens officiels de FLOP](https://docs.flop.network/docs/official-links) (FLOP n'a ni Discord ni Telegram officiel) |
+| `FLOP refused this miner earlier` | après un refus, ni `restart` ni l'installateur ne redemandent d'eux-mêmes. Changez ce que FLOP demandait (un nouvel octroi avec `--grant`, par exemple), puis `sudo flop-miner sponsor` |
+| `Unexpected answer from FLOP's sponsor` | l'installateur cesse de demander. Réessayez plus tard avec `sudo flop-miner sponsor` ; si cela continue, cherchez une nouvelle version de cet installateur |
+| `The miner is stopped` | `sudo flop-miner restart` le démarre et sollicite le parrain de FLOP : un mineur arrêté n'est jamais inscrit, puisqu'il ne pourrait pas répondre aux travaux d'étalonnage de FLOP |
 | `does not have the expected fingerprint` | FLOP a publié un nouveau paquet de mineur : attendez une nouvelle version de cet installateur. Ne contournez pas le contrôle |
 | `The files of your miner account are missing` | remettez `signer` et `miner-key.json` depuis votre sauvegarde (voir Pour aller plus loin), puis relancez la même commande |
 | `The retirement did not go through` | le mineur est déjà arrêté : relancez `sudo flop-miner retire` plus tard (FLOP refuse tant qu'une session ou un litige est ouvert) |
@@ -244,19 +259,25 @@ flowchart LR
   G["agents et passerelle de FLOP<br/>(sessions : pas encore ouvertes)"] --> T
 ```
 
-L'installateur suit le README du paquet de mineur de FLOP, à deux écarts près : il demande le parrainage en dernier,
-une fois que le mineur répond, et il ne crée pas le trousseau protégé par mot de passe du paquet (`miner.json`),
-qu'aucun script du paquet ne lit (ils signent avec le fichier `signer`).
+L'installateur suit le README du paquet de mineur de FLOP, à trois écarts près :
+
+- il demande le parrainage en dernier, une fois que le mineur répond, et seulement quand la page de limites de FLOP
+  dit le parrain ouvert ;
+- il épingle les trois images de FLOP par version et par empreinte, là où les réglages d'exemple du paquet nomment
+  les étiquettes flottantes `:stable` : le guide du mineur de FLOP demande des références par version et empreinte,
+  et dit « do not use floating stable or latest tags » ;
+- il ne crée pas le trousseau protégé par mot de passe du paquet (`miner.json`), qu'aucun script du paquet ne lit
+  (ils signent avec le fichier `signer`).
 
 | étape | ce que fait l'installateur |
 |---|---|
 | 1. Vérification | Ubuntu 22.04 ou 24.04, x86-64, une machine complète, 50 Go de disque libres, un GPU NVIDIA de 16 Go ou plus, pilote 580 ou plus récent, prise en charge du BF16 ; puis l'adresse publique : votre domaine, `<ip>.sslip.io`, ou un tunnel |
 | 2. Dépendances | installe ce qui manque : Docker depuis le dépôt de Docker, le NVIDIA container toolkit depuis le dépôt de NVIDIA, `jq`, `curl`, `openssl` ; ouvre les ports 80 et 443 dans `ufw` s'il est actif |
-| 3. Paquet de FLOP | télécharge `flop-miner-pack-devnet-ts-20261103c` depuis flop.network et compare son empreinte SHA-256 à celle que FLOP publie ; tout autre fichier est refusé |
+| 3. Paquet de FLOP | télécharge `flop-miner-pack-devnet-ts-20261106` depuis flop.network et compare son empreinte SHA-256 à celle que FLOP publie ; tout autre fichier est refusé |
 | 4. Compte | crée votre compte de mineur avec l'outil de clés de FLOP, dans l'image de FLOP épinglée par son empreinte, sans réseau |
-| 5. Modèle et réglages | télécharge le modèle avec le `fetch-model.sh` du paquet ; crée la seed de la clé de session et les réglages privés (`miner.env`) |
+| 5. Modèle et réglages | télécharge le modèle avec le `fetch-model.sh` du paquet ; crée la seed de la clé de session et les réglages privés (`miner.env`), avec les images de FLOP épinglées : CLI 0.1.220, worker 0.1.286, moteur 0.1.239 |
 | 6. Démarrage | `decode-policy.sh` (la chaîne de FLOP doit accepter la politique du modèle), puis Docker Compose démarre le moteur, le worker et, sans tunnel, Caddy ; l'installateur attend que l'adresse HTTPS réponde 401 |
-| 7. Parrainage | le `sponsor.sh` du paquet, signé sur la machine par votre compte de mineur ; une relance chaque heure tant que le parrain est plein |
+| 7. Parrainage | lit la page de limites de FLOP et les dernières inscriptions du parrain, puis lance le `sponsor.sh` du paquet, signé sur la machine par votre compte de mineur, dès que FLOP dit ouvert ; une minuterie horaire jusque-là |
 
 Ce qui reste sur la machine, lisible par root seulement :
 
@@ -271,9 +292,9 @@ Ce qui reste sur la machine, lisible par root seulement :
 
 Ce qui sort de la machine :
 
-- les requêtes vers le devnet de FLOP (son RPC, sa boîte d'étalonnage, son parrain), et vers son explorateur
-  (explorer.devnet.flop.network), que `status`, le parrainage (et sa relance horaire) et `uninstall` interrogent sur
-  votre mineur ;
+- les requêtes vers le devnet de FLOP (son RPC, sa boîte d'étalonnage, son parrain et la page de limites du
+  parrain), et vers son explorateur (explorer.devnet.flop.network), que `status`, le parrainage (et son coup d'œil
+  horaire) et `uninstall` interrogent sur votre mineur et sur les dernières inscriptions du parrain ;
 - les téléchargements : paquets d'Ubuntu, de Docker et de NVIDIA, flop.network, les images de FLOP sur le registre
   de GitHub, Docker Hub, le modèle depuis Hugging Face et les paquets de son outil de téléchargement depuis PyPI (tous
   deux par le `fetch-model.sh` du paquet), et le client de tunnel de Cloudflare depuis GitHub avec `--tunnel` ;
@@ -289,12 +310,12 @@ publique. Rien d'autre ne part, et rien ne va aux auteurs de ce guide.
 L'installateur est un seul fichier bash, lisible. Pour le lire avant de le lancer :
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Syphiliis/flop-gpu-miner/v0.1.0/flop-miner
+curl -fsSLO https://raw.githubusercontent.com/Syphiliis/flop-gpu-miner/v0.1.1/flop-miner
 less flop-miner
 sudo bash flop-miner install
 ```
 
-Vous lancez exactement le fichier que vous avez lu, et l'adresse désigne une version (`v0.1.0`), pas les derniers
+Vous lancez exactement le fichier que vous avez lu, et l'adresse désigne une version (`v0.1.1`), pas les derniers
 changements.
 
 ## Pour aller plus loin
@@ -325,10 +346,10 @@ autre GPU demande un nouvel étalonnage.
 
 **Plusieurs mineurs.** Une machine par mineur : chacun a son compte, son parrainage et son étalonnage.
 
-**Mises à jour.** `sudo flop-miner restart` prend les images actuelles de FLOP. Quand FLOP publie un nouveau paquet
-de mineur, une nouvelle version de cet installateur l'épingle : lancez la commande d'une ligne de la nouvelle
-version. Elle prend les réglages du nouveau paquet, garde votre compte, vos jetons et votre adresse, et met de côté
-l'ancien fichier de réglages.
+**Mises à jour.** L'installateur épingle les images de FLOP : `sudo flop-miner restart` redémarre donc avec les
+mêmes. Quand FLOP publie un nouveau paquet de mineur ou de nouvelles images, une nouvelle version de cet installateur
+les épingle : lancez la commande d'une ligne de la nouvelle version. Elle prend les réglages et les images du
+nouveau paquet, garde votre compte, vos jetons et votre adresse, et met de côté l'ancien fichier de réglages.
 
 **Désinstaller.** `sudo flop-miner uninstall` enlève les conteneurs, les minuteries et la commande, et garde vos clés
 dans `/opt/flop-miner`. Désinscrivez d'abord le mineur : après la désinstallation, la commande `retire` n'existe
@@ -336,22 +357,26 @@ plus. Ne supprimez `/opt/flop-miner` qu'après `retire`, et une fois votre phras
 
 ## État de ce guide
 
-Version 0.1.0, 5 novembre 2026. L'installateur est contrôlé sur un banc d'essai qui simule les outils extérieurs
-(`tests/run.sh` : ni GPU, ni FLOP, 180 contrôles). Les étapes de FLOP qu'il automatise viennent du README du paquet de
-FLOP et des scripts du paquet, lus le 5 novembre 2026. Aucun passage complet de cet installateur sur une vraie
-machine GPU jusqu'à l'étalonnage n'a encore été rapporté : si vous le lancez, partagez votre résultat dans une issue
-(GPU, fournisseur, sortie de `sudo flop-miner status`).
+Version 0.1.1, 8 novembre 2026. L'installateur est contrôlé sur un banc d'essai qui simule les outils extérieurs
+(`tests/run.sh` : ni GPU, ni FLOP, 291 contrôles). Les étapes de FLOP qu'il automatise viennent du README du paquet
+de FLOP et des scripts du paquet, et ses règles de parrainage du guide du mineur et du skill de FLOP, lus le
+8 novembre 2026. Aucun passage complet de cet installateur sur une vraie machine GPU jusqu'à l'étalonnage n'a encore
+été rapporté : si vous le lancez, partagez votre résultat dans une issue (GPU, fournisseur, sortie de
+`sudo flop-miner status`).
 
-Le devnet de FLOP change vite. L'installateur épingle le paquet de mineur pour lequel il a été écrit, et refuse tout
-autre. Quand FLOP change de paquet, il faut une nouvelle version de ce guide.
+Le devnet de FLOP change vite. L'installateur épingle le paquet de mineur et les images pour lesquels il a été écrit,
+et refuse tout autre paquet. Quand FLOP les change, il faut une nouvelle version de ce guide.
 
 ## Sources
 
-- FLOP, « Run a FLOP miner on a GPU host », mis à jour le 2 novembre 2026 : <https://docs.flop.network/docs/run-miner>
+- FLOP, « Run a FLOP miner on a GPU host », mis à jour le 3 novembre 2026 (admission, limites du devnet, épingles
+  exactes des images, règles du parrainage) : <https://docs.flop.network/docs/run-miner>
 - FLOP, « Put your GPU to work on FLOP » (étalonnage renouvelé chaque semaine) : <https://docs.flop.network/docs/run-gpu-provider>
-- Le paquet de mineur de FLOP et son README : <https://flop.network/releases/cli/miner-pack-devnet-ts-20261103c/README.md>
-- L'empreinte du paquet, publiée par FLOP : <https://flop.network/skills/flop-miner-devnet/SKILL.md>
-- Le manifeste des images et des modèles de FLOP : <https://flop.network/releases.json>
+- Le paquet de mineur de FLOP et son README : <https://flop.network/releases/cli/miner-pack-devnet-ts-20261106/README.md>
+- L'empreinte du paquet et les règles du parrainage, publiées par FLOP : <https://flop.network/skills/flop-miner-devnet/SKILL.md>
+- Les limites du parrain de FLOP, en direct : <https://faucet.flop.network/limits>
+- Le manifeste des images et des modèles de FLOP : <https://flop.network/releases.json> (les images elles-mêmes sont
+  sur le registre de GitHub, `ghcr.io/flop-labs/flop-core`)
 - Les liens officiels de FLOP (aucun jeton, devnet sans récompense ni poids d'airdrop) : <https://docs.flop.network/docs/official-links>
 - La FAQ de FLOP, testnet et calendrier : <https://docs.flop.network/docs/testnet-and-timeline>
 - L'explorateur du devnet de FLOP : <https://explorer.devnet.flop.network/mining>
